@@ -52,7 +52,7 @@ type session struct {
 
 // Main runs one helper invocation. args is git's (remote-name, URL) pair,
 // or a single URL when the cloak:: URL is used directly.
-func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "cloak: usage: git-remote-cloak <remote> <url>")
 		return 2
@@ -67,7 +67,15 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	in := bufio.NewScanner(stdin)
 	in.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	out := bufio.NewWriter(stdout)
-	defer func() { _ = out.Flush() }()
+	defer func() {
+		if err := out.Flush(); err != nil {
+			if code == 0 {
+				code = s.fatal(fmt.Errorf("flush remote-helper output: %w", err))
+			} else if s.log != nil {
+				s.log.Warn("flushing remote-helper output after failure also failed", "err", err)
+			}
+		}
+	}()
 
 	for in.Scan() {
 		done, err := s.dispatchLine(in, out, in.Text())
@@ -95,11 +103,15 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 func (s *session) dispatchLine(in *bufio.Scanner, out *bufio.Writer, line string) (done bool, err error) {
 	switch {
 	case line == "capabilities":
-		s.emitCapabilities(out)
+		return false, s.emitCapabilities(out)
 
 	case strings.HasPrefix(line, "option "):
-		fmt.Fprintln(out, s.option(strings.TrimPrefix(line, "option ")))
-		_ = out.Flush()
+		if _, err := fmt.Fprintln(out, s.option(strings.TrimPrefix(line, "option "))); err != nil {
+			return false, fmt.Errorf("write option response: %w", err)
+		}
+		if err := out.Flush(); err != nil {
+			return false, fmt.Errorf("flush option response: %w", err)
+		}
 
 	case line == "list" || line == "list for-push":
 		return false, s.handleList(out, line == "list for-push")
@@ -121,12 +133,19 @@ func (s *session) dispatchLine(in *bufio.Scanner, out *bufio.Writer, line string
 
 // emitCapabilities writes the advertised capabilities followed by the
 // terminating blank line and flushes.
-func (s *session) emitCapabilities(out *bufio.Writer) {
+func (s *session) emitCapabilities(out *bufio.Writer) error {
 	for _, c := range capabilities {
-		fmt.Fprintln(out, c)
+		if _, err := fmt.Fprintln(out, c); err != nil {
+			return fmt.Errorf("write capability response: %w", err)
+		}
 	}
-	fmt.Fprintln(out)
-	_ = out.Flush()
+	if _, err := fmt.Fprintln(out); err != nil {
+		return fmt.Errorf("write capability terminator: %w", err)
+	}
+	if err := out.Flush(); err != nil {
+		return fmt.Errorf("flush capability response: %w", err)
+	}
+	return nil
 }
 
 // collectBatch reads a contiguous batch of same-prefix protocol lines. first
@@ -235,14 +254,30 @@ func (s *session) handleList(out *bufio.Writer, forPush bool) error {
 	if err != nil {
 		return err
 	}
+	// Git omits the fetch batch entirely when all advertised ref closures are
+	// already local. Repair a missing/stale pin from that verified state here;
+	// otherwise a crash after FetchApply but before CommitPin would leave the
+	// trust anchors stale forever because the next fetch is list-only.
+	if repaired, err := s.eng.CommitPinIfComplete(s.rs); err != nil {
+		return err
+	} else if repaired {
+		s.log.Info("pins repaired from complete local object closure",
+			"generation", s.rs.Manifest.Generation)
+	}
 	// Clear the indicator before the ref advertisement: an up-to-date push sends
 	// no push batch, so git prints its summary to the terminal right after this.
 	s.spin.Stop()
 	for _, l := range lines {
-		fmt.Fprintln(out, l)
+		if _, err := fmt.Fprintln(out, l); err != nil {
+			return fmt.Errorf("write list response: %w", err)
+		}
 	}
-	fmt.Fprintln(out)
-	_ = out.Flush()
+	if _, err := fmt.Fprintln(out); err != nil {
+		return fmt.Errorf("write list terminator: %w", err)
+	}
+	if err := out.Flush(); err != nil {
+		return fmt.Errorf("flush list response: %w", err)
+	}
 	return nil
 }
 
@@ -290,10 +325,16 @@ func runBatch[T any](in *bufio.Scanner, out *bufio.Writer, line, prefix string,
 		return err
 	}
 	for _, l := range format(results) {
-		fmt.Fprintln(out, l)
+		if _, err := fmt.Fprintln(out, l); err != nil {
+			return fmt.Errorf("write %sresponse: %w", prefix, err)
+		}
 	}
-	fmt.Fprintln(out)
-	_ = out.Flush()
+	if _, err := fmt.Fprintln(out); err != nil {
+		return fmt.Errorf("write %sterminator: %w", prefix, err)
+	}
+	if err := out.Flush(); err != nil {
+		return fmt.Errorf("flush %sresponse: %w", prefix, err)
+	}
 	return nil
 }
 
@@ -319,8 +360,9 @@ func fetchLockLines(locks []string) []string {
 	return lines
 }
 
-// fetchBatch applies all missing manifest packs, then verifies every object
-// git asked for is now present. Returns .keep lock lines for the protocol.
+// fetchBatch applies all missing manifest packs, verifies every object Git
+// requested, then verifies the complete closure of every advertised ref before
+// advancing trust anchors. Returns .keep lock lines for the protocol.
 func (s *session) fetchBatch(reqs []string) ([]string, error) {
 	if err := s.ensure(); err != nil {
 		return nil, err
@@ -336,7 +378,17 @@ func (s *session) fetchBatch(reqs []string) ([]string, error) {
 				"object %s advertised by the manifest was not provided by any pack", oid)
 		}
 	}
-	// Only now that packs are applied and every requested object is present
+	if s.rs.Manifest != nil {
+		tips := make([]string, 0, len(s.rs.Manifest.Refs))
+		for _, oid := range s.rs.Manifest.Refs {
+			tips = append(tips, oid)
+		}
+		if !s.eng.HasObjectClosure(tips) {
+			return nil, cloakerr.Newf(cloakerr.Tamper, "fetch verification",
+				"downloaded packs do not provide the complete object closure of every advertised ref")
+		}
+	}
+	// Only now that packs are applied and the full advertised closure is present
 	// do the rollback and repo-identity pins advance.
 	if err := s.eng.CommitPin(s.rs); err != nil {
 		return nil, err

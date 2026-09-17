@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/b4ryon/git-remote-cloak/internal/keystore"
+	"github.com/b4ryon/git-remote-cloak/internal/urlredact"
 	"github.com/b4ryon/git-remote-cloak/internal/userpresence"
 )
 
@@ -18,10 +19,10 @@ import (
 // before a new one can be generated in its place.
 func keyExistsGuidance(stderr io.Writer, ref string) {
 	fmt.Fprintf(stderr, "cloak: a master key already exists at %s\n", ref)
-	fmt.Fprintln(stderr, "WARNING: removing it is permanent. You will NOT be able to decrypt anything")
+	fmt.Fprintln(stderr, "WARNING: removing the configured key is destructive. You will NOT be able to decrypt anything")
 	fmt.Fprintln(stderr, "already pushed under it, and the key cannot be recovered unless you saved an")
 	fmt.Fprintln(stderr, "export backup. Remove it first with:")
-	fmt.Fprintf(stderr, "    git cloak key delete --key %s\n", ref)
+	fmt.Fprintf(stderr, "    git cloak key delete --key %s\n", urlredact.ShellArg(ref))
 	fmt.Fprintln(stderr, "(If the remote already holds data, use `git cloak rekey` to re-encrypt under a")
 	fmt.Fprintln(stderr, "new key instead of deleting.)")
 }
@@ -72,7 +73,7 @@ func cmdKeygen(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "Generated master key %s\n", k.ID())
 	fmt.Fprintf(stdout, "Stored at %s\n", *ref)
-	fmt.Fprintf(stdout, "Back it up NOW to two independent locations: git cloak key export --key %s\n", *ref)
+	fmt.Fprintf(stdout, "Back it up NOW to two independent locations: git cloak key export --key %s\n", urlredact.ShellArg(*ref))
 	return 0
 }
 
@@ -100,7 +101,9 @@ func cmdKeyExport(args []string, stdout, stderr io.Writer) int {
 		return printFail(stderr, err)
 	}
 	defer k.Wipe()
-	fmt.Fprintln(stdout, k.Export())
+	if _, err := fmt.Fprintln(stdout, k.Export()); err != nil {
+		return printFail(stderr, fmt.Errorf("cloak: write exported key: %w", err))
+	}
 	return 0
 }
 
@@ -139,15 +142,28 @@ func cmdKeyImport(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 func cmdKeyDelete(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := newFlagSet("key delete", stderr)
 	ref := fs.String("key", keystore.DefaultRef(), "key reference (file:<path> or keychain:<name>)")
+	forceInsecure := fs.Bool("force-insecure", false,
+		"allow non-interactive deletion without a user-presence check")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	fmt.Fprintf(stderr, "WARNING: this permanently deletes the master key at %s.\n", *ref)
+	if err := userpresence.RequireExplicit("delete the master key", stderr, *forceInsecure); err != nil {
+		return printFail(stderr, err)
+	}
+	fmt.Fprintf(stderr, "WARNING: this deletes the configured master key at %s.\n", *ref)
 	fmt.Fprintln(stderr, "You will NOT be able to decrypt anything already pushed under it, and the key")
-	fmt.Fprintln(stderr, "cannot be recovered unless you saved an export backup.")
+	fmt.Fprintln(stderr, "cannot be recovered unless you saved an export backup. Filesystem snapshots or")
+	fmt.Fprintln(stderr, "independent copies are outside cloak's control and may still retain it.")
 	fmt.Fprint(stderr, "Type YES (in capitals) to delete, anything else to abort: ")
 	sc := bufio.NewScanner(stdin)
-	if !sc.Scan() || strings.TrimSpace(sc.Text()) != "YES" {
+	if !sc.Scan() {
+		if err := sc.Err(); err != nil {
+			return printFail(stderr, fmt.Errorf("cloak: read deletion confirmation: %w", err))
+		}
+		fmt.Fprintln(stderr, "cloak: aborted; key not deleted")
+		return 1
+	}
+	if strings.TrimSpace(sc.Text()) != "YES" {
 		fmt.Fprintln(stderr, "cloak: aborted; key not deleted")
 		return 1
 	}

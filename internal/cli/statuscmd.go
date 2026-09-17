@@ -10,6 +10,7 @@ import (
 	"github.com/b4ryon/git-remote-cloak/internal/manifest"
 	"github.com/b4ryon/git-remote-cloak/internal/setup"
 	"github.com/b4ryon/git-remote-cloak/internal/state"
+	"github.com/b4ryon/git-remote-cloak/internal/urlredact"
 	"github.com/b4ryon/git-remote-cloak/internal/userpresence"
 )
 
@@ -26,9 +27,9 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 	}
 	defer sess.Close()
 
-	fmt.Fprintf(stdout, "Remote:     %s\n", *remote)
+	fmt.Fprintf(stdout, "Remote:     %s\n", urlredact.URL(*remote))
 	if *url != "" {
-		fmt.Fprintf(stdout, "URL:        %s\n", *url)
+		fmt.Fprintf(stdout, "URL:        %s\n", urlredact.URL(*url))
 	}
 	fmt.Fprintf(stdout, "Key:        %s (%s)\n", sess.Eng.Key.ID(), sess.Cfg.KeyRef)
 	if sess.RS.Manifest == nil {
@@ -56,6 +57,7 @@ func printManifestStatus(sess *setup.Session, stdout, stderr io.Writer) int {
 		return cliFailLogged(stderr, sess, err)
 	}
 	printGenerationLine(stdout, m, pin, pinned)
+	fmt.Fprintf(stdout, "Manifest:   %s (current remote)\n", sess.RS.ManifestHash)
 	rid, ridOK, err := sess.St.LoadRepoID()
 	if err != nil {
 		return cliFailLogged(stderr, sess, err)
@@ -137,18 +139,19 @@ func printSyncState(stdout io.Writer, m *manifest.Manifest, pin state.Pin, pinne
 }
 
 // acceptSpec captures the parts that differ between the two user-presence-gated
-// "accept" overrides; runAccept holds their common spine: clear a local pin,
-// re-validate the remote, then re-pin the current state. The ordering is
-// security-relevant (clear before any validation runs) and lives in one place.
+// "accept" overrides; runAccept holds their common verified replacement path.
 type acceptSpec struct {
 	name        string // flagset name
 	remoteUsage string // -remote flag help text
 	presence    string // userpresence action, e.g. "accept rollback"
-	noun        string // local record being cleared, e.g. "pin" / "repo-id pin"
+	noun        string // local anchor being replaced, e.g. "pin" / "repo-id pin"
 	repinFail   string // re-pin error tail, e.g. "re-pinning failed"
+	// requireMatchingRepoID prevents accept-rollback from also accepting an
+	// unrelated repository identity. accept-repo-change deliberately disables it.
+	requireMatchingRepoID bool
 	// describe reports what is being discarded (or that nothing was set).
 	describe func(sess *setup.Session)
-	// clear removes the local pin.
+	// clear removes obsolete anchors when an explicitly accepted remote is empty.
 	clear func(sess *setup.Session) error
 	// accepted reports the final pinned state.
 	accepted func(sess *setup.Session)
@@ -158,10 +161,12 @@ func runAccept(spec acceptSpec, args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet(spec.name, stderr)
 	remote := fs.String("remote", "origin", spec.remoteUsage)
 	url := urlFlag(fs)
+	forceInsecure := fs.Bool("force-insecure", false,
+		"allow non-interactive trust-anchor changes without a user-presence check")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if err := userpresence.Require(spec.presence+" on remote "+describeTarget(*remote, *url), stderr); err != nil {
+	if err := userpresence.RequireExplicit(spec.presence+" on remote "+describeTarget(*remote, *url), stderr, *forceInsecure); err != nil {
 		return cliFail(stderr, err)
 	}
 	sess, err := setup.OpenLocal(*remote, *url, stderr, "cli")
@@ -172,50 +177,25 @@ func runAccept(spec acceptSpec, args []string, stdout, stderr io.Writer) int {
 	return runAcceptOnSession(spec, sess, stdout, stderr)
 }
 
-// runAcceptOnSession runs the protected accept transaction on an already-open
-// session: report what is being discarded, snapshot the local records, clear
-// them, re-validate the remote (restoring on failure so the remote is never
-// left unprotected), and re-pin the current state.
+// runAcceptOnSession leaves the old trust anchors installed while the candidate
+// remote is fetched and fully verified, then replaces both anchors. Only an
+// explicitly accepted empty remote requires clearing state.
 func runAcceptOnSession(spec acceptSpec, sess *setup.Session, stdout, stderr io.Writer) int {
 	spec.describe(sess)
-
-	// Snapshot the records about to be cleared so a later failure restores them
-	// instead of leaving the remote unprotected (reverted to TOFU). Accept must
-	// clear BEFORE re-validating -- LoadRemote runs CheckPin/CheckRepoID, which
-	// would otherwise reject the very rollback or repo-change being accepted --
-	// so the safety net is restore-on-failure, not validate-first. Only a
-	// cleanly-readable prior record is restored: a corrupt pin is exactly what
-	// accept exists to discard. Restore is best-effort; if it fails the fallback
-	// is the (cleared) TOFU state, i.e. the prior behavior, and the primary
-	// error is still reported.
-	prevPin, hadPin, _ := sess.St.LoadPin()
-	prevRepoID, hadRepoID, _ := sess.St.LoadRepoID()
-	restore := func() {
-		if hadPin {
-			_ = sess.St.SavePin(prevPin)
-		}
-		if hadRepoID {
-			_ = sess.St.SaveRepoID(prevRepoID)
-		}
-	}
-
-	if err := spec.clear(sess); err != nil {
-		return cliFailLogged(stderr, sess, err)
-	}
-	if err := sess.LoadRemote(); err != nil {
-		restore()
-		return cliFailLogged(stderr, sess, fmt.Errorf("%s cleared, but re-validating the remote failed: %w", spec.noun, err))
+	if err := sess.LoadRemoteUnchecked(); err != nil {
+		return cliFailLogged(stderr, sess,
+			fmt.Errorf("candidate remote could not be read; existing %s remains unchanged: %w", spec.noun, err))
 	}
 	if sess.RS.Manifest == nil {
-		// The remote really is empty: leave the pin cleared (restoring it would
-		// re-raise the "empty but generation N seen" rollback alarm). Next push
-		// recreates and re-pins.
+		if err := spec.clear(sess); err != nil {
+			return cliFailLogged(stderr, sess, err)
+		}
 		fmt.Fprintln(stdout, "Accepted: remote is currently empty; next push recreates it.")
 		return 0
 	}
-	if err := sess.Eng.CommitPin(sess.RS); err != nil {
-		restore()
-		return cliFailLogged(stderr, sess, fmt.Errorf("%s cleared, but %s: %w", spec.noun, spec.repinFail, err))
+	if err := sess.Eng.VerifyApplyAndCommitPin(sess.RS, spec.requireMatchingRepoID); err != nil {
+		return cliFailLogged(stderr, sess,
+			fmt.Errorf("candidate remote rejected; existing %s remains unchanged because %s: %w", spec.noun, spec.repinFail, err))
 	}
 	spec.accepted(sess)
 	return 0
@@ -223,20 +203,21 @@ func runAcceptOnSession(spec acceptSpec, sess *setup.Session, stdout, stderr io.
 
 func cmdAcceptRollback(args []string, stdout, stderr io.Writer) int {
 	return runAccept(acceptSpec{
-		name:        "accept-rollback",
-		remoteUsage: "cloak remote to accept the regression for",
-		presence:    "accept rollback",
-		noun:        "pin",
-		repinFail:   "re-pinning the current state failed",
+		name:                  "accept-rollback",
+		remoteUsage:           "cloak remote to accept the regression for",
+		presence:              "accept rollback",
+		noun:                  "pin",
+		repinFail:             "re-pinning the current state failed",
+		requireMatchingRepoID: true,
 		describe: func(sess *setup.Session) {
 			// A corrupt/unreadable pin is exactly what accept-rollback exists to
 			// clear, so surface the load error instead of silently reporting
 			// "nothing to accept"; clear() below still discards it.
 			switch pin, ok, err := sess.St.LoadPin(); {
 			case err != nil:
-				fmt.Fprintf(stdout, "Discarding unreadable rollback pin (%v).\n", err)
+				fmt.Fprintf(stdout, "Will replace unreadable rollback pin after verification (%v).\n", err)
 			case ok:
-				fmt.Fprintf(stdout, "Discarding rollback pin: generation %d, manifest %.12s\n", pin.Generation, pin.ManifestHash)
+				fmt.Fprintf(stdout, "Current rollback pin to replace after verification: generation %d, manifest %.12s\n", pin.Generation, pin.ManifestHash)
 			default:
 				fmt.Fprintln(stdout, "No rollback pin was set (nothing to accept).")
 			}
@@ -258,17 +239,18 @@ func cmdAcceptRollback(args []string, stdout, stderr io.Writer) int {
 // repository.
 func cmdAcceptRepoChange(args []string, stdout, stderr io.Writer) int {
 	return runAccept(acceptSpec{
-		name:        "accept-repo-change",
-		remoteUsage: "cloak remote to accept the repo-identity change for",
-		presence:    "accept repo-identity change",
-		noun:        "repo-id pin",
-		repinFail:   "re-pinning failed",
+		name:                  "accept-repo-change",
+		remoteUsage:           "cloak remote to accept the repo-identity change for",
+		presence:              "accept repo-identity change",
+		noun:                  "repo-id pin",
+		repinFail:             "re-pinning failed",
+		requireMatchingRepoID: false,
 		describe: func(sess *setup.Session) {
 			switch rid, ok, err := sess.St.LoadRepoID(); {
 			case err != nil:
-				fmt.Fprintf(stdout, "Discarding unreadable repo-id pin (%v).\n", err)
+				fmt.Fprintf(stdout, "Will replace unreadable repo-id pin after verification (%v).\n", err)
 			case ok:
-				fmt.Fprintf(stdout, "Discarding pinned repo id: %s\n", rid)
+				fmt.Fprintf(stdout, "Current repo id to replace after verification: %s\n", rid)
 			default:
 				fmt.Fprintln(stdout, "No repo id was pinned (nothing to accept).")
 			}
@@ -280,9 +262,9 @@ func cmdAcceptRepoChange(args []string, stdout, stderr io.Writer) int {
 			// Also reset the rollback pin: a different repository has an
 			// unrelated generation history, so keeping the old generation pin
 			// would trip the repo-id/generation consistency cross-check (CR-005)
-			// during re-validation and could raise a spurious rollback alarm
-			// against the new repo. CommitPin re-pins both from the accepted
-			// remote; runAcceptOnSession restores both on failure.
+			// during re-validation and could raise a spurious rollback alarm.
+			// This clear path is used only when the accepted remote is empty;
+			// populated candidates replace both pins after full verification.
 			return sess.St.ClearPin()
 		},
 		accepted: func(sess *setup.Session) {

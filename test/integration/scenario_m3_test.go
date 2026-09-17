@@ -166,6 +166,213 @@ func TestScenario2ConcurrentPushRace(t *testing.T) {
 	}
 }
 
+// TestConcurrentDeleteRejectsStaleRetry proves that retrying the carrier CAS
+// does not turn a delete authorized against the originally advertised tip into
+// an unconditional delete of a concurrently advanced branch. Disjoint-ref
+// races may be merged, but a same-destination change must be surfaced as stale.
+func TestConcurrentDeleteRejectsStaleRetry(t *testing.T) {
+	host, key, a := pushSetup(t)
+	b := harness.NewClient(t, "b", key)
+	b.MustClone(host.Dir)
+
+	hold := t.TempDir()
+	type pushOut struct {
+		stderr string
+		err    error
+	}
+	done := make(chan pushOut, 1)
+	go func() {
+		_, stderr, err := a.GitEnv([]string{"CLOAK_TEST_HOLD_BEFORE_PUSH=" + hold},
+			"push", "origin", ":main")
+		done <- pushOut{stderr, err}
+	}()
+	waitForFile(t, filepath.Join(hold, "waiting"), 15*time.Second)
+
+	b.WriteFile("b.md", "advance main from b\n")
+	b.Commit("advance main from b")
+	b.MustGit("push", "origin", "main")
+
+	if err := os.WriteFile(filepath.Join(hold, "release"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := <-done
+	if res.err == nil {
+		t.Fatal("stale delete succeeded after the destination ref changed")
+	}
+	if !strings.Contains(res.stderr, "stale info") {
+		t.Fatalf("stale delete did not report stale info: %s", res.stderr)
+	}
+	if !strings.Contains(a.DebugLog(), "compare-and-swap lost") {
+		t.Fatal("delete race did not exercise the CAS retry path")
+	}
+
+	c := harness.NewClient(t, "c", key)
+	c.MustClone(host.Dir)
+	if got, want := c.MustGit("rev-parse", "origin/main"), b.HeadOID(); got != want {
+		t.Fatalf("stale delete removed/replaced concurrent main: %s != %s", got, want)
+	}
+}
+
+// TestConcurrentForceRejectsStaleRetry proves that a force flag is not reused
+// as authorization to overwrite a destination that changed after Git's ref
+// advertisement. The original update may be destructive, but only against the
+// exact tip the caller saw before attempt zero.
+func TestConcurrentForceRejectsStaleRetry(t *testing.T) {
+	host, key, a := pushSetup(t)
+	b := harness.NewClient(t, "b", key)
+	b.MustClone(host.Dir)
+
+	a.WriteFile("a.md", "diverge a\n")
+	a.Commit("diverge a")
+	b.WriteFile("b.md", "diverge b\n")
+	b.Commit("diverge b")
+
+	hold := t.TempDir()
+	type pushOut struct {
+		stderr string
+		err    error
+	}
+	done := make(chan pushOut, 1)
+	go func() {
+		_, stderr, err := a.GitEnv([]string{"CLOAK_TEST_HOLD_BEFORE_PUSH=" + hold},
+			"push", "--force", "origin", "main")
+		done <- pushOut{stderr, err}
+	}()
+	waitForFile(t, filepath.Join(hold, "waiting"), 15*time.Second)
+
+	b.MustGit("push", "origin", "main")
+
+	if err := os.WriteFile(filepath.Join(hold, "release"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := <-done
+	if res.err == nil {
+		t.Fatal("stale forced update succeeded after the destination ref changed")
+	}
+	if !strings.Contains(res.stderr, "stale info") {
+		t.Fatalf("stale forced update did not report stale info: %s", res.stderr)
+	}
+	if !strings.Contains(a.DebugLog(), "compare-and-swap lost") {
+		t.Fatal("force race did not exercise the CAS retry path")
+	}
+
+	c := harness.NewClient(t, "c", key)
+	c.MustClone(host.Dir)
+	if got, want := c.MustGit("rev-parse", "origin/main"), b.HeadOID(); got != want {
+		t.Fatalf("stale force replaced concurrent main: %s != %s", got, want)
+	}
+}
+
+// TestConcurrentAlreadyAtDesiredBecomesNoOp covers the safe same-destination
+// exception: if the CAS winner published the exact oid this push requested,
+// the retry reports success without manufacturing another backend generation.
+func TestConcurrentAlreadyAtDesiredBecomesNoOp(t *testing.T) {
+	host, key, a := pushSetup(t)
+	b := harness.NewClient(t, "b", key)
+	b.MustClone(host.Dir)
+
+	a.WriteFile("shared.md", "same desired commit\n")
+	a.Commit("shared desired commit")
+	desired := a.HeadOID()
+	b.MustGit("fetch", a.Dir, "main")
+	b.MustGit("reset", "--hard", "FETCH_HEAD")
+	if got := b.HeadOID(); got != desired {
+		t.Fatalf("test setup produced different desired oid: %s != %s", got, desired)
+	}
+
+	hold := t.TempDir()
+	type pushOut struct {
+		stderr string
+		err    error
+	}
+	done := make(chan pushOut, 1)
+	go func() {
+		_, stderr, err := a.GitEnv([]string{"CLOAK_TEST_HOLD_BEFORE_PUSH=" + hold},
+			"push", "origin", "main")
+		done <- pushOut{stderr, err}
+	}()
+	waitForFile(t, filepath.Join(hold, "waiting"), 15*time.Second)
+
+	b.MustGit("push", "origin", "main")
+	winnerHead := host.Git("rev-parse", "cloak")
+	winnerGeneration := pinGeneration(t, b)
+
+	if err := os.WriteFile(filepath.Join(hold, "release"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("already-at-desired retry was rejected: %v\nstderr: %s", res.err, res.stderr)
+	}
+	if !strings.Contains(a.DebugLog(), "compare-and-swap lost") {
+		t.Fatal("same-desired race did not exercise the CAS retry path")
+	}
+	if got := host.Git("rev-parse", "cloak"); got != winnerHead {
+		t.Fatalf("already-at-desired retry created a redundant generation: %s != %s", got, winnerHead)
+	}
+	if got := pinGeneration(t, a); got != winnerGeneration {
+		t.Fatalf("already-at-desired retry left stale pin generation %d, want %d", got, winnerGeneration)
+	}
+}
+
+// TestCASRetryKeepsOriginalLocalSource proves a disjoint carrier race cannot
+// make the retry publish a newer local commit created after `git push` began.
+// The remote-helper protocol supplies a symbolic source ref, so cloak must
+// resolve and freeze its object id before attempt zero.
+func TestCASRetryKeepsOriginalLocalSource(t *testing.T) {
+	host, key, a := pushSetup(t)
+	b := harness.NewClient(t, "b", key)
+	b.MustClone(host.Dir)
+
+	a.WriteFile("first.md", "the commit requested by push\n")
+	a.Commit("first local commit")
+	requested := a.HeadOID()
+
+	hold := t.TempDir()
+	type pushOut struct {
+		stderr string
+		err    error
+	}
+	done := make(chan pushOut, 1)
+	go func() {
+		_, stderr, err := a.GitEnv([]string{"CLOAK_TEST_HOLD_BEFORE_PUSH=" + hold},
+			"push", "origin", "main")
+		done <- pushOut{stderr, err}
+	}()
+	waitForFile(t, filepath.Join(hold, "waiting"), 15*time.Second)
+
+	// Move A's local source after the first attempt has been prepared.
+	a.WriteFile("later.md", "must remain local to A for this push\n")
+	a.Commit("later local commit")
+	later := a.HeadOID()
+	if later == requested {
+		t.Fatal("test setup did not move A's local source ref")
+	}
+
+	// Advance only a disjoint remote ref so A is allowed to retry main.
+	b.MustGit("checkout", "-q", "-b", "side")
+	b.WriteFile("side.md", "disjoint carrier update\n")
+	b.Commit("side branch")
+	b.MustGit("push", "origin", "side")
+
+	if err := os.WriteFile(filepath.Join(hold, "release"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("disjoint retry failed: %v\nstderr: %s", res.err, res.stderr)
+	}
+	if !strings.Contains(a.DebugLog(), "compare-and-swap lost") {
+		t.Fatal("source-freeze race did not exercise the CAS retry path")
+	}
+
+	c := harness.NewClient(t, "c", key)
+	c.MustClone(host.Dir)
+	if got := c.MustGit("rev-parse", "origin/main"); got != requested {
+		t.Fatalf("retry published moved local source %s, want original %s (later local %s)", got, requested, later)
+	}
+}
+
 func TestScenario3RefConflict(t *testing.T) {
 	host, key, a := pushSetup(t)
 	b := harness.NewClient(t, "b", key)
@@ -241,6 +448,37 @@ func TestScenario9MidConnectionStaleRejection(t *testing.T) {
 	}
 	if got, want := c.MustGit("rev-parse", "origin/branch-b"), b.HeadOID(); got != want {
 		t.Fatalf("branch-b lost in mid-connection race: %s != %s", got, want)
+	}
+}
+
+// TestBackendPolicyRejectionIsNotRetriedAsCAS distinguishes a stable carrier
+// ref rejected by host policy from a real compare-and-swap loss. Retrying an
+// always-rejecting hook only hides the useful host diagnostic behind an
+// eventual CAS-exhausted error.
+func TestBackendPolicyRejectionIsNotRetriedAsCAS(t *testing.T) {
+	host, _, a := pushSetup(t)
+	before := host.Git("rev-parse", "cloak")
+	a.WriteFile("blocked.md", "must not reach the carrier\n")
+	a.Commit("blocked by carrier policy")
+
+	host.InstallPreReceive("#!/bin/sh\necho 'carrier policy rejects writes' >&2\nexit 1\n")
+	defer host.RemovePreReceive()
+
+	_, stderr, err := a.Git("push", "origin", "main")
+	if err == nil {
+		t.Fatal("push unexpectedly passed a rejecting carrier hook")
+	}
+	if !strings.Contains(stderr, "carrier policy rejects writes") &&
+		!strings.Contains(stderr, "pre-receive hook declined") {
+		t.Fatalf("carrier rejection diagnostic was not surfaced: %s", stderr)
+	}
+	if strings.Contains(stderr, "retries exhausted") ||
+		strings.Contains(a.DebugLog(), "compare-and-swap lost") {
+		t.Fatalf("stable policy rejection was misclassified as a CAS loss\nstderr: %s\nlog: %s",
+			stderr, a.DebugLog())
+	}
+	if got := host.Git("rev-parse", "cloak"); got != before {
+		t.Fatalf("rejecting hook changed carrier head: %s != %s", got, before)
 	}
 }
 

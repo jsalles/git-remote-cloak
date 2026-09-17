@@ -6,6 +6,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,32 +23,51 @@ import (
 // consolidate merges the victim packs into one and rewrites plan in place:
 // the new pack carries Replaces so up-to-date clients skip the download,
 // and the resulting push becomes a squash.
-func (e *Engine) consolidate(cur *RemoteState, plan *pushPlan, victims []manifest.Pack) error {
+func (e *Engine) consolidate(cur *RemoteState, plan *pushPlan, victims []manifest.Pack) (consolidated bool, retErr error) {
 	e.phase("consolidating packs")
 	scratch, err := os.MkdirTemp(e.St.TmpDir(), "scratch-")
 	if err != nil {
-		return fmt.Errorf("create consolidation scratch dir: %w", err)
+		return false, fmt.Errorf("create consolidation scratch dir: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(scratch) }()
+	defer func() {
+		if err := os.RemoveAll(scratch); err != nil {
+			consolidated = false
+			retErr = errors.Join(retErr, fmt.Errorf("remove consolidation scratch directory %q: %w", scratch, err))
+		}
+	}()
 	scratchGit := filepath.Join(scratch, "odb.git")
 	if _, _, err := e.G.Run(gitx.Opts{Scrub: true}, "init", "--bare", "--quiet", scratchGit); err != nil {
-		return cloakerr.New(cloakerr.LocalGit, "init scratch repo", err)
+		return false, cloakerr.New(cloakerr.LocalGit, "init scratch repo", err)
 	}
 
 	victimIDs, canMark, err := e.indexVictims(scratchGit, cur, plan, victims)
 	if err != nil {
-		return err
+		return false, err
 	}
-	pw, err := e.packConsolidated(scratchGit)
+	pw, overLimit, err := e.packConsolidated(scratchGit)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if overLimit {
+		e.Log.Info("skipping geometric consolidation: actual merged pack exceeds cloak.maxPackBytes",
+			"victims", len(victimIDs), "limit", e.Cfg.MaxPackBytes)
+		return false, nil
+	}
+	if e.actualConsolidationWouldExceed(pw.Size()) {
+		path := pw.Path()
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return false, fmt.Errorf("remove over-limit consolidated pack %q: %w", path, err)
+		}
+		e.Log.Info("skipping geometric consolidation: actual merged pack exceeds cloak.maxPackBytes",
+			"victims", len(victimIDs), "actual_bytes", pw.Size(), "limit", e.Cfg.MaxPackBytes)
+		return false, nil
 	}
 	if err := e.applyConsolidation(plan, pw, victimIDs, canMark); err != nil {
-		return err
+		return false, err
 	}
 	e.Log.Info("consolidated packs", "victims", len(victimIDs),
 		"merged_bytes", pw.Size(), "live_packs", len(plan.man.Packs))
-	return nil
+	return true, nil
 }
 
 // indexVictims indexes each victim pack into the scratch repository and reports
@@ -117,24 +137,32 @@ func canMarkConsolidated(victims []manifest.Pack, notYetPushedID string, applied
 }
 
 // packConsolidated enumerates every object now in the scratch repository and
-// writes them all into a single freshly encrypted pack.
-func (e *Engine) packConsolidated(scratchGit string) (*agecrypt.PackWriter, error) {
+// writes them into a single freshly encrypted pack. overLimit reports that the
+// bounded ciphertext writer stopped at cloak.maxPackBytes; the caller then
+// keeps the original victim packs instead of publishing the oversized result.
+func (e *Engine) packConsolidated(scratchGit string) (*agecrypt.PackWriter, bool, error) {
 	objects, _, err := e.G.Run(gitx.Opts{GitDir: scratchGit},
 		"cat-file", "--batch-all-objects", "--batch-check=%(objectname)")
 	if err != nil {
-		return nil, cloakerr.New(cloakerr.LocalGit, "enumerate scratch objects", err)
+		return nil, false, cloakerr.New(cloakerr.LocalGit, "enumerate scratch objects", err)
 	}
-	pw, err := agecrypt.NewPackWriter(e.St.TmpDir(), e.Key)
+	pw, err := agecrypt.NewPackWriterLimited(e.St.TmpDir(), e.Key, e.Cfg.MaxPackBytes)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, agecrypt.ErrCiphertextLimit) {
+			return nil, true, nil
+		}
+		return nil, false, err
 	}
 	if err := e.streamPack(pw, gitx.Opts{GitDir: scratchGit,
 		Stdin: strings.NewReader(objects), Stdout: pw},
 		"pack consolidated objects", "finalize consolidated pack",
 		"--stdout", "--delta-base-offset"); err != nil {
-		return nil, err
+		if pw.LimitExceeded() || errors.Is(err, agecrypt.ErrCiphertextLimit) {
+			return pw, true, nil
+		}
+		return nil, false, err
 	}
-	return pw, nil
+	return pw, false, nil
 }
 
 // applyConsolidation rewrites plan in place to replace the victim packs with
@@ -194,12 +222,12 @@ func consolidatedPacks(packs []manifest.Pack, victimIDs []string, id string, siz
 // given repository's object store. localPath supplies the ciphertext from
 // disk (a not-yet-pushed pack); otherwise it is downloaded from the backend
 // commit and hash-verified against its id.
-func (e *Engine) indexPackInto(gitDir, head string, p manifest.Pack, localPath string) error {
+func (e *Engine) indexPackInto(gitDir, head string, p manifest.Pack, localPath string) (retErr error) {
 	short := p.ID[:12]
 	ctPath := localPath
 	if ctPath == "" {
 		ctPath = filepath.Join(e.St.TmpDir(), "cons-"+short+".age")
-		defer func() { _ = os.Remove(ctPath) }()
+		defer joinScratchRemoval(ctPath, "consolidation pack ciphertext", &retErr)
 		if err := e.downloadVerifyPack(head, ctPath, p); err != nil {
 			return err
 		}
@@ -208,7 +236,11 @@ func (e *Engine) indexPackInto(gitDir, head string, p manifest.Pack, localPath s
 	if err != nil {
 		return fmt.Errorf("open pack ciphertext scratch file %q: %w", ctPath, err)
 	}
-	defer func() { _ = ct.Close() }()
+	defer func() {
+		if err := ct.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close consolidation pack ciphertext %q: %w", ctPath, err))
+		}
+	}()
 	plain, err := agecrypt.Decrypt(ct, e.Key)
 	if err != nil {
 		return cloakerr.WithHintOn(err, packTamperHint)
@@ -229,7 +261,7 @@ type repackAttempt struct {
 	done  bool
 }
 
-// FullRepack rebuilds the remote as a single pack of objects reachable from
+// FullRepack rebuilds the remote as one or more packs of objects reachable from
 // the manifest refs (sourced from the local repository), optionally under a
 // new master key (rekey), and squashes the backend chain with a lease push.
 // It owns only the retry loop: each iteration delegates one attempt to
@@ -247,7 +279,11 @@ func (e *Engine) FullRepack(rs *RemoteState, newKey *keystore.Key) (*RemoteState
 	for attempt := 0; attempt <= e.Cfg.PushRetries; attempt++ {
 		a, err := e.repackOnce(cur, key, newKey != nil, attempt)
 		if err != nil {
-			return nil, err
+			// A non-nil state means the carrier accepted the new generation but
+			// persisting local bookkeeping failed afterwards. In particular, the
+			// rekey caller must still switch cloak.keyRef to the new key or strand
+			// this repository on a key that no longer decrypts the remote.
+			return a.state, err
 		}
 		if a.done {
 			return a.state, nil
@@ -260,64 +296,92 @@ func (e *Engine) FullRepack(rs *RemoteState, newKey *keystore.Key) (*RemoteState
 }
 
 // repackOnce runs a single full-repack attempt against cur under key: it
-// re-applies the remote, packs every reachable object into one squashing pack,
+// re-applies the remote, packs every reachable object into a size-bounded set,
 // builds the re-rooted backend commit, and lease-pushes it. It reports done=true
 // with the new remote state when the push is accepted, or done=false with the
 // re-fetched state when the compare-and-swap is lost so the caller can retry.
 func (e *Engine) repackOnce(cur *RemoteState, key keystore.Key, rekeyed bool, attempt int) (repackAttempt, error) {
-	pw, err := e.repackPack(cur, key)
+	operation := "repack"
+	if rekeyed {
+		operation = "rekey"
+	}
+	if cur == nil || cur.Manifest == nil {
+		return repackAttempt{}, cloakerr.Newf(cloakerr.Rollback, operation,
+			"carrier became empty before the operation could commit")
+	}
+	if _, err := nextManifestGeneration(operation, cur.Manifest.Generation); err != nil {
+		return repackAttempt{}, err
+	}
+	packs, err := e.repackPacks(cur, key, operation)
 	if err != nil {
 		return repackAttempt{}, err
 	}
-	man := repackManifest(cur, pw.ID(), pw.Size())
-	res, bc, err := e.commitAndPushRepack(cur, man, pw, key)
+	man, err := repackManifest(cur, packs)
+	if err != nil {
+		(&pushPlan{packs: packs}).abort()
+		return repackAttempt{}, err
+	}
+	if err := man.Validate(); err != nil {
+		(&pushPlan{packs: packs}).abort()
+		return repackAttempt{}, fmt.Errorf("repack manifest invalid (bug): %w", err)
+	}
+	res, bc, err := e.commitAndPushRepack(cur, man, packs, key, attempt)
 	if err != nil {
 		return repackAttempt{}, err
 	}
 	switch res {
 	case backend.PushOK:
-		return e.acceptRepack(man, bc, rekeyed)
+		return e.acceptRepack(man, bc, packs, rekeyed)
 	case backend.PushCASLost:
-		return e.retryRepackAfterCASLost(attempt)
+		return e.retryRepackAfterCASLost(attempt, cur)
 	}
 	return repackAttempt{state: cur, done: false}, nil
 }
 
 // acceptRepack records a backend-accepted full repack (the PushOK arm of
 // repackOnce): it persists the pin/repo-id/applied state, logs acceptance, and
-// returns the resolved attempt carrying the new remote state. The merged pack is
-// always marked applied (its objects came from the local repository).
-func (e *Engine) acceptRepack(man *manifest.Manifest, bc builtCommit, rekeyed bool) (repackAttempt, error) {
-	if err := e.persistPushed(man.Generation, bc.manifestHash, man.RepoID,
-		[]plannedPack{{id: man.Packs[0].ID, applied: true}}); err != nil {
-		return repackAttempt{}, err
+// returns the resolved attempt carrying the new remote state. Every repack pack
+// is marked applied because its objects came from the local repository.
+func (e *Engine) acceptRepack(man *manifest.Manifest, bc builtCommit, packs []plannedPack, rekeyed bool) (repackAttempt, error) {
+	next := &RemoteState{Head: bc.commit, Manifest: man, ManifestHash: bc.manifestHash}
+	if err := e.persistPushed(man.Generation, bc.manifestHash, man.RepoID, packs); err != nil {
+		operation := "repack"
+		if rekeyed {
+			operation = "rekey"
+		}
+		return repackAttempt{state: next, done: true},
+			fmt.Errorf("carrier accepted %s but persisting local state failed: %w", operation, err)
 	}
 	e.Log.Info("full repack pushed", "generation", man.Generation,
-		"pack_bytes", man.Packs[0].Size, "rekeyed", rekeyed)
-	return repackAttempt{state: &RemoteState{Head: bc.commit, Manifest: man, ManifestHash: bc.manifestHash}, done: true}, nil
+		"packs", len(man.Packs), "pack_bytes", sumPackSizes(man.Packs), "rekeyed", rekeyed)
+	return repackAttempt{state: next, done: true}, nil
 }
 
 // retryRepackAfterCASLost handles the PushCASLost arm of repackOnce: it
 // re-fetches the remote state and returns a not-done attempt so the FullRepack
 // loop retries the next attempt against it. (Info, not Warn like Push: a repack
 // is an explicit maintenance operation, so a lost race is routine progress.)
-func (e *Engine) retryRepackAfterCASLost(attempt int) (repackAttempt, error) {
+func (e *Engine) retryRepackAfterCASLost(attempt int, previous *RemoteState) (repackAttempt, error) {
 	e.Log.Info("repack lost compare-and-swap; re-fetching and retrying", "attempt", attempt)
 	next, err := e.LoadRemoteState()
 	if err != nil {
 		return repackAttempt{}, err
 	}
+	if err := validateRetryAdvance("repack", previous, next); err != nil {
+		return repackAttempt{}, err
+	}
 	return repackAttempt{state: next, done: false}, nil
 }
 
-// repackPack re-applies the remote (FetchApply) and packs every object
-// reachable from the manifest refs, sourced from the local repository, into a
-// single freshly encrypted pack under key. FetchApply runs inside each attempt
-// because after a lost compare-and-swap the reloaded manifest may reference
-// objects a concurrent push added, which the local repository must hold before
-// pack-objects can want them. streamPack aborts pw on any error, so a failed
-// pack leaves no temp file behind.
-func (e *Engine) repackPack(cur *RemoteState, key keystore.Key) (*agecrypt.PackWriter, error) {
+// repackPacks re-applies the remote (FetchApply) and packs every object
+// reachable from the manifest refs, sourced from the local repository, into
+// freshly encrypted packs under key. It first takes the streaming single-pack
+// path, then reuses the normal push splitter when the result exceeds
+// cloak.maxPackBytes. FetchApply runs inside each attempt because after a lost
+// compare-and-swap the reloaded manifest may reference objects a concurrent
+// push added, which the local repository must hold before pack-objects can want
+// them. Every returned pack is self-contained and marked applied.
+func (e *Engine) repackPacks(cur *RemoteState, key keystore.Key, operation string) ([]plannedPack, error) {
 	if _, err := e.FetchApply(cur); err != nil {
 		return nil, err
 	}
@@ -325,60 +389,78 @@ func (e *Engine) repackPack(cur *RemoteState, key keystore.Key) (*agecrypt.PackW
 	for _, oid := range cur.Manifest.Refs {
 		wantList = append(wantList, oid)
 	}
-	var wants strings.Builder
-	for _, oid := range wantList {
-		fmt.Fprintln(&wants, oid)
-	}
-	pw, err := agecrypt.NewPackWriter(e.St.TmpDir(), key)
+	stdin, _ := e.buildPackRevs(wantList, nil)
+	bp, err := e.buildSinglePack(stdin, key, operation)
 	if err != nil {
 		return nil, err
 	}
-	if err := e.streamPack(pw, gitx.Opts{GitDir: e.LocalGitDir,
-		Stdin: strings.NewReader(wants.String()), Stdout: pw},
-		"pack reachable objects", "finalize repack pack",
-		"--revs", "--stdout", "--delta-base-offset"); err != nil {
-		return nil, err
+	budget := splitBudget(e.Cfg.MaxPackBytes)
+	if bp.overLimit {
+		if budget == 0 {
+			return nil, e.checkPackLimit(operation, bp.size, wantList, nil)
+		}
+		return e.splitEncryptPacks(stdin, wantList, budget, key, operation)
 	}
-	// A repack squashes the whole repo into one pack; refuse before upload if it
-	// would not fit the host's per-file limit (no split can help a single pack).
-	// streamPack left the ciphertext temp file, so remove it on refusal.
-	if err := e.checkPackLimit("repack", pw.Size(), wantList, nil); err != nil {
-		_ = os.Remove(pw.Path())
-		return nil, err
+	if e.Cfg.MaxPackBytes <= 0 || bp.size <= e.Cfg.MaxPackBytes || budget == 0 {
+		if err := e.checkPackLimit(operation, bp.size, wantList, nil); err != nil {
+			if removeErr := os.Remove(bp.path); removeErr != nil && !os.IsNotExist(removeErr) {
+				return nil, errors.Join(err, fmt.Errorf("remove over-limit encrypted %s pack %q: %w", operation, bp.path, removeErr))
+			}
+			return nil, err
+		}
+		return []plannedPack{{id: bp.id, path: bp.path, size: bp.size, applied: true}}, nil
 	}
-	return pw, nil
+	if err := os.Remove(bp.path); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("remove superseded single %s pack %q: %w", operation, bp.path, err)
+	}
+	return e.splitEncryptPacks(stdin, wantList, budget, key, operation)
 }
 
 // repackManifest builds the next-generation manifest for a full repack: a clone
 // of cur's manifest with the generation bumped and its pack set replaced by the
-// single merged pack (identified by id and ciphertext size), carrying every
-// prior pack id as Replaces. Taking the merged pack's id/size directly (rather
-// than the *agecrypt.PackWriter) keeps this a pure manifest-construction
-// function the caller passes pw.ID()/pw.Size() into.
-func repackManifest(cur *RemoteState, id string, size int64) *manifest.Manifest {
+// new size-bounded packs. A single replacement pack carries every prior live
+// pack id in Replaces, preserving the existing download-skip optimization. A
+// split full repack omits Replaces: copying the complete old set into every new
+// pack would make the manifest grow O(old packs * new packs), and a client must
+// receive the whole split set unless its complete ref closure is already local.
+func repackManifest(cur *RemoteState, packs []plannedPack) (*manifest.Manifest, error) {
+	generation, err := nextManifestGeneration("repack", cur.Manifest.Generation)
+	if err != nil {
+		return nil, err
+	}
 	oldIDs := make([]string, 0, len(cur.Manifest.Packs))
 	for _, p := range cur.Manifest.Packs {
 		oldIDs = append(oldIDs, p.ID)
 	}
 	man := cur.Manifest.Clone()
-	man.Generation++
-	man.Packs = []manifest.Pack{{ID: id, Size: size, Replaces: oldIDs}}
-	return man
+	man.Generation = generation
+	man.Packs = make([]manifest.Pack, 0, len(packs))
+	var replaces []string
+	if len(packs) == 1 {
+		replaces = oldIDs
+	}
+	for _, p := range packs {
+		man.Packs = append(man.Packs, manifest.Pack{
+			ID: p.id, Size: p.size, Replaces: append([]string(nil), replaces...),
+		})
+	}
+	return man, nil
 }
 
 // commitAndPushRepack assembles the re-rooted backend commit for man (no parent
 // chain; a repack squashes the history) and lease-pushes it against cur.Head.
-// pw's temp ciphertext is removed once the commit is built regardless of
-// outcome. The returned PushResult is meaningful only when err is nil.
-func (e *Engine) commitAndPushRepack(cur *RemoteState, man *manifest.Manifest, pw *agecrypt.PackWriter, key keystore.Key) (backend.PushResult, builtCommit, error) {
+// Every pack's temp ciphertext is removed once the commit is built regardless
+// of outcome. The returned PushResult is meaningful only when err is nil.
+func (e *Engine) commitAndPushRepack(cur *RemoteState, man *manifest.Manifest, packs []plannedPack, key keystore.Key, attempt int) (backend.PushResult, builtCommit, error) {
 	bc, err := e.buildBackendCommit(commitInput{
-		man: man, packs: []plannedPack{{id: pw.ID(), path: pw.Path(), size: pw.Size(), applied: true}},
+		man: man, packs: packs,
 		blobSource: "", parent: "", key: key,
 	})
-	_ = os.Remove(pw.Path())
+	(&pushPlan{packs: packs}).abort()
 	if err != nil {
 		return 0, builtCommit{}, err
 	}
+	holdHook(attempt)
 	res, err := e.Be.PushLease(bc.commit, cur.Head)
 	return res, bc, err
 }

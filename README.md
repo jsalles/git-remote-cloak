@@ -5,7 +5,8 @@
 A git remote helper that stores an end-to-end encrypted mirror of a git
 repository on any ordinary git host. The host sees only opaque
 AEAD-encrypted blobs: no file contents, no filenames, no commit messages,
-no branch names, no history graph. Local repositories stay plain git.
+no source branch names, and no source history graph. It still sees the fixed
+carrier layout and its update cadence. Local repositories stay plain git.
 
 ![git-remote-cloak illustration](illustration.png)
 
@@ -24,19 +25,29 @@ trusted machines that hold the key:
 - Confidential small-document collaboration through a host you would rather
   not trust with plaintext.
 - Off-site encrypted backup of small sensitive datasets.
-- A tamper- and rollback-evident mirror on an untrusted host.
+- A tamper- and rollback-evident mirror on an untrusted host, within each
+  client's locally pinned history (see the split-view limitation below).
 
 ## Not a good fit
 
 - Source you want host-side features on (CI, pull requests, blame, code
   search), the host sees only ciphertext; use a normal private repo.
 - Large or binary-heavy repos, they work, but inefficiently (whole-pack
-  ciphertext, no host-side dedup or partial fetch, no git-LFS). Host file-size
-  limits apply to the encrypted packs: GitHub, for example, rejects any pushed
-  file over 100 MB and caps a single push at ~2 GB, so a pack exceeding those
-  will fail to push. cloak catches the per-file case before upload and refuses
-  with the offending file named (`cloak.maxPackBytes`, default 100 MiB).
+  ciphertext, no source-object-level host dedup or partial clone, no git-LFS).
+  Host file-size limits apply to the encrypted packs: GitHub, for example,
+  rejects any pushed file over 100 MB and caps a single push at ~2 GB. cloak
+  splits pushes and full repacks into multiple encrypted packs below the
+  configured per-file limit; a single object that cannot fit is refused before
+  upload with its path named (`cloak.maxPackBytes`, default 100 MiB).
+
+> [!WARNING]
+> Do not add Git LFS to a cloak-backed repository. LFS objects use a separate
+> transport and are not protected by cloak's encrypted remote. cloak refuses
+> tracked `filter=lfs` attributes and standard Git LFS pre-push hooks before
+> sync; it cannot intercept a separately invoked `git lfs push` command.
 - Many users needing differentiated access, one shared key, no per-user ACLs.
+- Shallow repositories, grafts, or `git replace` overlays. cloak rejects them
+  because incomplete/rewritten traversal would weaken closure verification.
 - Hiding traffic rather than content, repo existence, owner, push timing, and
   pack sizes/counts still leak.
 - Cases where you already trust the host, a plain private repo is simpler.
@@ -46,16 +57,20 @@ trusted machines that hold the key:
 A ground-up replacement for `git-remote-gcrypt` that fixes its known design
 problems:
 
-- Concurrent pushes are safe by construction (compare-and-swap via git's
-  fast-forward and stale-info checks), not self-healed after silent clobbers.
+- Concurrent pushes use an exact expected-head `--force-with-lease`
+  compare-and-swap, including normal fast-forward updates and initial branch
+  creation. Destructive inner-ref retries retain their original advertised
+  destination state rather than silently clobbering a winner.
 - No GPG: encryption uses the age v1 format with a single shared symmetric
   key (ChaCha20-Poly1305), stored in the macOS Keychain or a key file.
-- Host rollback/replay of old state is detected and refused (monotonic
-  generation counter), not silently accepted.
+- Host rollback/replay below one client's last locally pinned state is detected
+  and refused (monotonic generation plus same-generation ciphertext checks),
+  not silently accepted. This is not a cross-client transparency guarantee.
 - Substituting another repository's encrypted state under the same key is
-  refused, not merely warned about: a random repository identity is bound
-  inside the AEAD manifest and pinned (trust-on-first-use); a mismatch is a
-  hard error needing an explicit override.
+  refused after that identity has been pinned, not merely warned about: a
+  random repository identity is bound inside the AEAD manifest and pinned
+  (trust-on-first-use); a mismatch is a hard error needing an explicit
+  override.
 - Pack consolidation is geometric, with no periodic full-history re-upload.
 - Errors are reported as what they are (auth vs network vs missing repo vs
   tamper vs rollback).
@@ -64,22 +79,28 @@ problems:
 
 ### Install
 
-Prerequisites: Go 1.26+ and git. On macOS, install the Xcode command line tools
-(`xcode-select --install`) for the cgo Keychain/Touch ID key backend; Linux
-builds are pure Go and use a key file.
+Prerequisites: git and Go 1.26.6 or newer. The module's `go` directive enforces
+that security patch level; a compatible older launcher with automatic
+toolchain selection may download it. Install 1.26.6 directly for offline builds. On macOS, install
+the Xcode command line tools (`xcode-select --install`) for the cgo
+Keychain/Touch ID key backend; Linux builds are pure Go and use a key file.
+Library versions are locked by `go.mod`/`go.sum`: currently `filippo.io/age`
+v1.3.2, `golang.org/x/crypto` v0.57.0, `golang.org/x/term` v0.46.0, and
+`golang.org/x/text` v0.42.0 are direct dependencies. No separate `age`
+executable is used.
 
 ```
 git clone https://github.com/b4ryon/git-remote-cloak.git
 cd git-remote-cloak
 make install                   # builds + installs git-remote-cloak and the
                                # git-cloak symlink into ~/bin (override PREFIX=).
-                               # Version is derived from the latest git tag.
+                               # Version identifies the exact tag/commit/dirty tree.
 ```
 
 Both names must be on your PATH: git runs `git-remote-cloak` for `cloak::` URLs,
 and `git cloak ...` resolves to the `git-cloak` symlink. Add the PATH line to
-your shell profile so new shells (and GUI apps) inherit it, not just the current
-shell:
+your shell profile so new shells inherit it. Apps launched from the macOS
+Finder do not normally read shell startup files; see the Obsidian note below.
 
 ```
 export PATH="$HOME/bin:$PATH"  # put this in ~/.zshrc / ~/.bashrc, then open a NEW shell
@@ -119,11 +140,51 @@ git cloak key import                 # paste the exported key
 git clone cloak::git@github.com:you/private-repo.git
 ```
 
+The carrier branch (named `cloak` by default) must permit force updates. Full
+repack, rekey, and automatic consolidation replace its commit chain with an exact
+`--force-with-lease`; a GitHub ruleset that forbids force pushes will block
+those operations. Do not add required CI checks to this ciphertext-only branch.
+
+If this repository uses a non-default, per-repository key reference, the new
+clone must receive that setting before its first fetch:
+
+```
+git cloak key import --key keychain:private-repo
+git clone --config cloak.keyRef=keychain:private-repo \
+  cloak::git@github.com:you/private-repo.git
+```
+
+Use an appropriate fresh `file:<absolute-path>` reference instead on systems
+without Keychain support. A bare `key import` targets the platform default and
+will refuse to overwrite an old key already stored there.
+
+Prefer SSH carrier URLs as shown above. If you use HTTPS, let Git's credential
+helper supply authentication. cloak refuses HTTP(S) userinfo and transport URLs
+containing passwords, queries, or fragments, because a safe diagnostic could
+not also reproduce those URLs for recovery. SSH usernames remain supported.
+Backend URLs are limited to local paths, scp-like SSH locations, and Git's
+built-in `file`, `git`, `http`, `https`, `ssh`, and `git+ssh` schemes; arbitrary
+`git-remote-<scheme>` helpers are not executed.
+Diagnostics additionally redact credential-shaped URLs as defense in depth.
+The host and repository path remain visible, so choose a non-sensitive carrier
+name. Redaction is not secret storage.
+
 The key lives only on your machines (the host holds only ciphertext), so losing
 every copy makes the data unrecoverable: back the key up before pushing real
 data, and keep the repository private. cloak hides contents, filenames, and
 history structure, but not the repo's existence, owner, or push metadata (pack
 sizes, count, and timing).
+
+The ciphertext uses an age v1 container with cloak's custom `cloak/v1`
+recipient stanza. Stock `age` cannot decrypt it. Recovery therefore requires
+the key **and** a compatible `git-remote-cloak` build; archive a pinned source
+revision or verified binary with your recovery material.
+
+Every fetch and push URL configured on the source repository must invoke the
+`cloak::` transport. A plain SSH/HTTPS URL bypasses this helper and sends the
+ordinary Git repository. Until an external pre-push policy enforces this
+automatically, inspect all URLs with `git remote -v` after setup or
+configuration changes.
 
 ### Everyday use
 
@@ -131,6 +192,14 @@ There is no separate sync command: once the `cloak::` remote is configured, use
 git as usual. `git push`, `git pull`, `git fetch`, and `git clone` transparently
 encrypt outbound and decrypt inbound. (Scheduled/background auto-sync is not part
 of the tool.)
+
+If Git discovers that every advertised ref is already present locally, it may
+send only a `list` request and no fetch batch. cloak verifies the complete local
+object closure in that path and repairs an absent pin pair or a stale generation
+pin. It does not advance a pin when the closure is incomplete, and inconsistent
+or mismatched pin state still fails closed. This makes an interruption after
+pack application self-healing without turning list-only operations into an
+integrity bypass.
 
 ### Replicating to a second host (multiple push URLs)
 
@@ -144,7 +213,8 @@ git config --add remote.origin.pushurl cloak::git@backup-host:you/notes-mirror.g
 ```
 
 (The first `--add` repeats the fetch URL: once any pushurl is set, git no
-longer pushes to the fetch URL.) Each push URL is its own cloak backend with
+longer pushes to the fetch URL.) Every entry must retain its `cloak::` prefix.
+Each push URL is its own cloak backend with
 its own local state (mirror, rollback pin, repo identity) under `.git/cloak/`,
 so integrity alarms and recovery are per URL. `git cloak` commands operate on
 the fetch URL by default; select another backend with `--url`:
@@ -165,19 +235,31 @@ install on cloak's side. After the key and remote setup above, in your vault:
 
 ```
 cd /path/to/YourVault
-git init
-printf '.obsidian/workspace*\n.obsidian/cache\n.trash/\n.DS_Store\n' > .gitignore
+git init -b main  # git < 2.28: git init && git branch -M main
+printf '\n/.obsidian\n/.obsidian.backup\n/.trash\n.DS_Store\n' >> .gitignore
 git remote add origin cloak::git@github.com:you/notes-private.git
 git add -A && git commit -m "initial vault" && git push -u origin main
 ```
 
+The command appends rather than overwrites; review and deduplicate an existing
+`.gitignore` as needed. In particular, `/.obsidian` intentionally has no trailing
+slash: that form excludes both a real directory and an `.obsidian` symlink;
+`/.obsidian/` does not ignore the symlink itself. Confirm none of these paths is
+already tracked before the first encrypted push. Do not add Git LFS for images
+or other attachments: its separate object transport bypasses cloak. cloak also
+refuses standard Git LFS pre-push hooks.
+
 For automatic commit-and-sync, use the [Obsidian Git](https://github.com/Vinzent03/obsidian-git)
 community plugin: on desktop it shells out to your system git, so cloak runs
-transparently. Ensure `git-remote-cloak` is on the PATH Obsidian sees, macOS
-GUI apps get a minimal PATH, so install it under e.g. `/usr/local/bin`
-(`make install PREFIX=/usr/local/bin`), not just `~/bin`. Mobile Obsidian is
-unsupported: its Git plugin uses a pure-JavaScript git (isomorphic-git) that
-cannot run remote helpers.
+transparently. Ensure `git-remote-cloak` is on the PATH of the Obsidian process,
+not merely an interactive shell. On each desktop, add the absolute directory
+containing both cloak binaries (for example `/Users/you/bin`) under Obsidian
+Git's **Additional PATH environment variable paths** setting, one directory per
+line, then use **Reload with new environment variables**.
+Alternatively install them in a directory already on Obsidian's PATH. Perform
+one supervised plugin sync to verify helper discovery before enabling background
+sync. Mobile Obsidian is unsupported: its Git plugin uses a pure-JavaScript git
+(isomorphic-git) that cannot run remote helpers.
 
 macOS code-signing note: the Keychain key backend binds its access control to
 the helper's code signature. The build default is an ad-hoc signature, which
@@ -190,7 +272,9 @@ build with a stable self-signed code-signing certificate
 ### Operator commands (`git cloak`)
 
 - `status`, remote generation, repo id, packs, applied state.
-- `repack` / `rekey`, full consolidation / re-encrypt under a new key.
+- `repack` / `rekey`, rewrite reachable objects into a size-bounded pack set /
+  re-encrypt that set under a new key. Either command may produce multiple
+  encrypted packs.
 - `accept-rollback` / `accept-repo-change`, one-shot overrides for a detected
   generation regression or repository-identity change (user-presence gated).
 - `key export [--force-insecure]` / `key import` / `key delete`, key transfer,
@@ -199,6 +283,27 @@ build with a stable self-signed code-signing certificate
 Remote-facing commands take `--remote <name>` (default `origin`) and, on a
 remote with multiple push URLs, `--url <cloak::url>` to pick which backend to
 operate on (default: the fetch URL).
+
+`rekey`, `key delete`, `accept-rollback`, and `accept-repo-change` require an
+interactive user-presence check. A headless invocation is refused unless it
+explicitly passes `--force-insecure`; that flag records the caller's decision
+to bypass the prompt and must not be added casually to general-purpose
+automation. `key delete` still requires the separate typed `YES` confirmation.
+If a rekey's transport and confirmation probe both fail, its error treats the
+outcome as unknown and tells you how to test the new key without discarding the
+old one.
+
+For a key rotation, create and export a fresh reference before rekeying. On each
+other machine, import the new key into a fresh local reference, then point that
+repository at it:
+
+```
+git cloak key import --key keychain:private-repo-next
+git config cloak.keyRef keychain:private-repo-next
+```
+
+Use a suitable `file:<absolute-path>` reference where Keychain is unavailable.
+Bare `git cloak key import` cannot overwrite the old default key.
 
 ### Configuration
 
@@ -214,13 +319,20 @@ git config (`cloak.*`):
 - `pushRetries`, compare-and-swap retry budget under concurrent pushes (default 5).
 - `branch`, the backend branch name on the host (default `cloak`).
 - `maxPackBytes`, the largest encrypted pack (one host file) cloak will publish.
-  A push or repack that would exceed it is refused *before upload*, naming the
-  largest files so you know what to shrink, and leaving no partial upload.
+  Pushes, repacks, and rekeys that exceed it in aggregate are split into several
+  self-contained packs. A single object that still exceeds it is refused
+  *before upload*, naming the file so you know what to shrink and leaving no
+  partial upload. Do not use Git LFS; it bypasses cloak's encrypted transport.
   Default `104857600` (100 MiB, GitHub's per-file hard cap); set `0` to disable
   (a self-hosted host with no limit), or raise it for a host with a higher cap.
   A consolidation that would cross the limit is skipped rather than failing the
   push. If the limit is left unset/too high and the host rejects the push, cloak
   still reports it clearly as a "pack too large for host" error.
+  The same value bounds cloak's receive-side scratch copy, decryption, and
+  application. Git's promisor fetch necessarily transfers and stores a requested
+  outer blob in the private backend mirror before cloak can inspect its size;
+  a carrier that ignores partial-clone filters may transfer all blobs eagerly.
+  The carrier therefore retains a network/backend-cache denial-of-service path.
 
 Environment: `CLOAK_GIT_TIMEOUT` (git subprocess timeout, default 120s; `0`/`off`
 disables), `CLOAK_LOG` (per-repo debug log level).
@@ -238,12 +350,41 @@ a few properties are accepted trade-offs rather than protected:
   `.git/cloak/<remote>/` state is deleted) there is no pin yet, so the first
   manifest that decrypts under your key is trusted. A host that tampered with the
   *initial* state could serve any state that validates under the shared key. To
-  close this, compare `git cloak status` (generation and manifest hash) against
-  the other machine before trusting a brand-new clone.
-- **Key export can be scripted.** `git cloak key export` is gated by a
-  user-presence (Touch ID) prompt, but `--force-insecure` deliberately skips it
-  for non-interactive backups. Any process running as you with that flag can read
-  the raw key, by design, treat the key like any other top-level secret.
+  mitigate this, compare `git cloak status` (repo id, generation, and manifest
+  hash) against the other machine before trusting a brand-new clone.
+- **Pins do not prevent a Byzantine split view.** Pins are local and there is
+  no transparency log, cross-device gossip, or authenticated single-history
+  proof. A malicious host that possesses multiple valid ciphertext histories
+  can keep different clients on different monotonically advancing forks, or
+  later move a client to a higher-generation fork, without triggering the
+  lower-generation/same-generation checks. Compare status out of band and keep
+  an independent backup if this attacker is in scope.
+- **Rekey is not retroactive erasure.** It replaces the current carrier state
+  with ciphertext under the new key, but a host, backup, reflog, or attacker may
+  retain older ciphertext. A compromised old key can still decrypt everything
+  encrypted under it; rekey protects future writes only. Treat old content as
+  exposed and rotate any rotatable secrets that appeared in history. Moving
+  future writes to a fresh carrier can reduce further exposure, but cannot
+  erase ciphertext someone already copied.
+- **Endpoints hold plaintext.** The working repository, Git object database,
+  editor, backups, and the running helper are trusted. cloak does not protect
+  against malware, administrators, or monitoring on an unlocked client.
+- **Local scratch and cache capacity are endpoint concerns.** cloak bounds the
+  ciphertext it copies into decrypt/apply scratch, and bounds the initial
+  encrypted pack build. Git can still cache a carrier blob before that check,
+  and an unsplittable local object can make Git materialize an over-limit
+  plaintext split pack before cloak refuses it. Stale cloak scratch is cleaned
+  under the per-remote lock on the next session.
+- **A sync mirror is not the only backup.** Remote deletion, account loss,
+  local key loss, or a software defect can still make the mirror unavailable.
+  Keep an independently encrypted, restore-tested backup of repository data,
+  key material, and a compatible cloak binary or pinned source revision.
+- **Sensitive overrides can be scripted deliberately.** `key export`, `key
+  delete`, `rekey`, `accept-rollback`, and `accept-repo-change` are
+  user-presence gated, but
+  `--force-insecure` deliberately permits non-interactive use. Any process
+  running as you can request that bypass; treat it as an exceptional operator
+  action, not a routine sync option.
 
 ## Build and test
 
@@ -262,7 +403,7 @@ make check              # vet + lint + vuln + test + test-integration + test-dar
 
 cloak builds on:
 
-- [age](https://age-encryption.org) (`filippo.io/age`) by Filippo Valsorda and
+- [age](https://age-encryption.org) (`filippo.io/age` v1.3.2) by Filippo Valsorda and
   contributors, the encryption format and the stanza/STREAM primitives.
 - [`golang.org/x/crypto`](https://pkg.go.dev/golang.org/x/crypto),
   [`golang.org/x/term`](https://pkg.go.dev/golang.org/x/term), and

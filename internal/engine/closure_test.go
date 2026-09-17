@@ -69,6 +69,34 @@ func TestHasObjectClosure(t *testing.T) {
 	if eng.HasObjectClosure([]string{tip}) {
 		t.Fatal("incomplete history: HasObjectClosure must be false when the tip is present but ancestors are missing")
 	}
+
+	// Marking the present tip as a shallow boundary makes ordinary rev-list hide
+	// the missing parent. HasObjectClosure must reject shallow topology rather
+	// than mistake that truncated walk for complete history.
+	if err := os.WriteFile(filepath.Join(bGit, "shallow"), []byte(tip+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if eng.HasObjectClosure([]string{tip}) {
+		t.Fatal("shallow boundary made incomplete history appear complete")
+	}
+}
+
+func TestHasObjectClosureStreamsLargeRefSet(t *testing.T) {
+	repo := t.TempDir()
+	gitInDir(t, repo, "init", "-q")
+	gitInDir(t, repo, "commit", "-q", "--allow-empty", "-m", "tip")
+	tip := gitInDir(t, repo, "rev-parse", "HEAD")
+
+	// 70,000 SHA-1 arguments occupy about 2.8 MiB, above ARG_MAX on the
+	// supported macOS and typical Linux hosts. The old argv-based closure walk
+	// therefore returned false before Git started; stdin framing must succeed.
+	tips := make([]string, 70_000)
+	for i := range tips {
+		tips[i] = tip
+	}
+	if !newEngine(filepath.Join(repo, ".git")).HasObjectClosure(tips) {
+		t.Fatal("complete closure was rejected for a ref set larger than argv")
+	}
 }
 
 // copyLooseObject copies a single loose object file between object stores,

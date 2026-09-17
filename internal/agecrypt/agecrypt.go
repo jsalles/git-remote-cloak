@@ -18,6 +18,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"fmt"
 	"io"
 
 	"filippo.io/age"
@@ -32,8 +33,12 @@ import (
 const StanzaType = "cloak/v1"
 
 const (
-	saltSize  = 32
-	wrapLabel = "cloak/v1 wrap"
+	saltSize = 32
+	// age v1 fixes the per-file key at 16 bytes. The stanza body is that key
+	// sealed with a 16-byte Poly1305 authentication tag.
+	ageFileKeySize     = 16
+	wrappedFileKeySize = ageFileKeySize + chacha20poly1305.Overhead
+	wrapLabel          = "cloak/v1 wrap"
 )
 
 // deriveWrapKey derives the per-blob file-key-wrapping key AND nonce from the
@@ -65,6 +70,9 @@ func zero(b []byte) {
 type recipient struct{ master keystore.Key }
 
 func (r recipient) Wrap(fileKey []byte) ([]*age.Stanza, error) {
+	if len(fileKey) != ageFileKeySize {
+		return nil, fmt.Errorf("wrap file key: got %d bytes, want %d", len(fileKey), ageFileKeySize)
+	}
 	salt := make([]byte, saltSize)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, err
@@ -103,7 +111,7 @@ func (i identity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
 // stanza are indistinguishable here, so both leave ok=false; the caller
 // surfaces age.ErrIncorrectIdentity once every stanza is exhausted.
 func (i identity) tryUnwrapStanza(s *age.Stanza) ([]byte, bool) {
-	if s.Type != StanzaType || len(s.Args) != 1 {
+	if s.Type != StanzaType || len(s.Args) != 1 || len(s.Body) != wrappedFileKeySize {
 		return nil, false
 	}
 	salt, err := base64.RawStdEncoding.DecodeString(s.Args[0])
@@ -121,7 +129,8 @@ func (i identity) tryUnwrapStanza(s *age.Stanza) ([]byte, bool) {
 	}
 	fileKey, err := aead.Open(nil, nonce, s.Body, nil)
 	zero(wk)
-	if err != nil {
+	if err != nil || len(fileKey) != ageFileKeySize {
+		zero(fileKey)
 		return nil, false
 	}
 	return fileKey, true

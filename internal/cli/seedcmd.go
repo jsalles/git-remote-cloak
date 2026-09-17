@@ -7,6 +7,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,10 +17,14 @@ import (
 
 	"github.com/b4ryon/git-remote-cloak/internal/agecrypt"
 	"github.com/b4ryon/git-remote-cloak/internal/backend"
+	"github.com/b4ryon/git-remote-cloak/internal/cloakerr"
+	"github.com/b4ryon/git-remote-cloak/internal/config"
+	"github.com/b4ryon/git-remote-cloak/internal/engine"
 	"github.com/b4ryon/git-remote-cloak/internal/gitx"
 	"github.com/b4ryon/git-remote-cloak/internal/keystore"
 	"github.com/b4ryon/git-remote-cloak/internal/logx"
 	"github.com/b4ryon/git-remote-cloak/internal/manifest"
+	"github.com/b4ryon/git-remote-cloak/internal/urlredact"
 )
 
 func cmdDebugSeedRemote(args []string, stdout, stderr io.Writer) int {
@@ -27,7 +32,13 @@ func cmdDebugSeedRemote(args []string, stdout, stderr io.Writer) int {
 	ref := keyFlag(fs)
 	from := fs.String("from", "", "plain source repository (required)")
 	branch := fs.String("branch", "cloak", "backend branch name on the host")
+	maxPackBytes := fs.Int64("max-pack-bytes", config.Defaults().MaxPackBytes,
+		"largest encrypted seed pack to publish (0 disables the limit)")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *maxPackBytes < 0 {
+		fmt.Fprintln(stderr, "cloak: --max-pack-bytes must be non-negative")
 		return 2
 	}
 	if *from == "" || fs.NArg() != 1 {
@@ -45,7 +56,7 @@ func cmdDebugSeedRemote(args []string, stdout, stderr io.Writer) int {
 	defer closeLog()
 	g := gitx.New(lg)
 
-	s := &seeder{g: g, lg: lg, key: key, url: url, branch: *branch}
+	s := &seeder{g: g, lg: lg, key: key, url: url, branch: *branch, maxPackBytes: *maxPackBytes}
 	if err := s.run(*from, stdout); err != nil {
 		return cliFail(stderr, err)
 	}
@@ -57,17 +68,21 @@ func cmdDebugSeedRemote(args []string, stdout, stderr io.Writer) int {
 // phase hangs off it as a method taking only its own per-phase inputs,
 // mirroring how Engine threads g/key through the push path.
 type seeder struct {
-	g      *gitx.G
-	lg     *slog.Logger
-	key    keystore.Key
-	url    string
-	branch string
+	g            *gitx.G
+	lg           *slog.Logger
+	key          keystore.Key
+	url          string
+	branch       string
+	maxPackBytes int64
 }
 
-func (s *seeder) run(from string, stdout io.Writer) error {
+func (s *seeder) run(from string, stdout io.Writer) (retErr error) {
 	fromGitDir, err := s.g.Out(gitx.Opts{Dir: from}, "rev-parse", "--absolute-git-dir")
 	if err != nil {
 		return fmt.Errorf("resolve source repo: %w", err)
+	}
+	if err := s.validateSourceTopology(fromGitDir); err != nil {
+		return err
 	}
 
 	refs, wants, head, err := s.collectSeedRefs(fromGitDir)
@@ -82,7 +97,11 @@ func (s *seeder) run(from string, stdout io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("create seed scratch dir under %q: %w", fromGitDir, err)
 	}
-	defer func() { _ = os.RemoveAll(work) }()
+	defer func() {
+		if err := os.RemoveAll(work); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("remove seed scratch directory %q: %w", work, err))
+		}
+	}()
 
 	pw, err := s.packSeedObjects(fromGitDir, work, wants)
 	if err != nil {
@@ -98,7 +117,34 @@ func (s *seeder) run(from string, stdout io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "Seeded %s (branch %s): generation 1, %d refs, pack %s (%d bytes)\n",
-		s.url, s.branch, len(refs), pw.ID()[:12], pw.Size())
+		urlredact.URL(s.url), s.branch, len(refs), pw.ID()[:12], pw.Size())
+	return nil
+}
+
+func (s *seeder) validateSourceTopology(gitDir string) error {
+	shallow, err := s.g.Out(gitx.Opts{GitDir: gitDir}, "rev-parse", "--is-shallow-repository")
+	if err != nil {
+		return fmt.Errorf("inspect seed source shallow state: %w", err)
+	}
+	if shallow == "true" {
+		return fmt.Errorf("seed source is shallow; full history is required")
+	}
+	replacements, err := s.g.Out(gitx.Opts{GitDir: gitDir}, "replace", "-l")
+	if err != nil {
+		return fmt.Errorf("inspect seed source replacements: %w", err)
+	}
+	if replacements != "" {
+		return fmt.Errorf("seed source uses git replace objects; rewritten history is unsupported")
+	}
+	grafts, err := s.g.Out(gitx.Opts{GitDir: gitDir}, "rev-parse", "--path-format=absolute", "--git-path", "info/grafts")
+	if err != nil {
+		return fmt.Errorf("inspect seed source grafts: %w", err)
+	}
+	if fi, statErr := os.Stat(grafts); statErr == nil && fi.Size() > 0 {
+		return fmt.Errorf("seed source uses git grafts; rewritten history is unsupported")
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return fmt.Errorf("inspect seed source grafts: %w", statErr)
+	}
 	return nil
 }
 
@@ -144,8 +190,11 @@ func parseSeedRefs(out string) (refs map[string]string, wants []string) {
 // packSeedObjects packs the full history (all wants, no haves) into a fresh
 // encrypting PackWriter under work, aborting the writer on failure.
 func (s *seeder) packSeedObjects(fromGitDir, work string, wants []string) (*agecrypt.PackWriter, error) {
-	pw, err := agecrypt.NewPackWriter(work, s.key)
+	pw, err := agecrypt.NewPackWriterLimited(work, s.key, s.maxPackBytes)
 	if err != nil {
+		if errors.Is(err, agecrypt.ErrCiphertextLimit) {
+			return nil, s.seedPackTooLarge(s.maxPackBytes + 1)
+		}
 		return nil, err
 	}
 	_, _, err = s.g.Run(gitx.Opts{GitDir: fromGitDir,
@@ -154,12 +203,25 @@ func (s *seeder) packSeedObjects(fromGitDir, work string, wants []string) (*agec
 		"pack-objects", "--revs", "--stdout", "--delta-base-offset")
 	if err != nil {
 		pw.Abort()
+		if pw.LimitExceeded() || errors.Is(err, agecrypt.ErrCiphertextLimit) {
+			return nil, s.seedPackTooLarge(s.maxPackBytes + 1)
+		}
 		return nil, fmt.Errorf("pack source objects: %w", err)
 	}
 	if err := pw.Close(); err != nil {
+		pw.Abort()
+		if pw.LimitExceeded() || errors.Is(err, agecrypt.ErrCiphertextLimit) {
+			return nil, s.seedPackTooLarge(s.maxPackBytes + 1)
+		}
 		return nil, err
 	}
 	return pw, nil
+}
+
+func (s *seeder) seedPackTooLarge(size int64) error {
+	return cloakerr.Newfh(cloakerr.TooLarge, "seed remote",
+		"remove or shrink large files, raise --max-pack-bytes for a carrier with a higher per-file cap, or use the normal multi-pack push path; do not use Git LFS because it bypasses cloak encryption",
+		"encrypted seed pack is at least %d bytes, exceeding the limit of %d", size, s.maxPackBytes)
 }
 
 // seedManifest assembles the genesis (generation-1) manifest for a freshly
@@ -186,11 +248,7 @@ func (s *seeder) buildSeedManifest(head string, refs map[string]string, pw *agec
 		return nil, nil, err
 	}
 	m := seedManifest(repoID, head, refs, pw.ID(), pw.Size())
-	plain, err := manifest.Encode(m)
-	if err != nil {
-		return nil, nil, err
-	}
-	manifestCT, err := agecrypt.EncryptBytes(s.key, plain)
+	manifestCT, _, err := engine.EncryptManifest(m, s.key)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -216,7 +274,7 @@ func (s *seeder) pushSeedCommit(work string, m *manifest.Manifest, manifestCT []
 	if err != nil {
 		return err
 	}
-	res, err := be.PushFF(commit)
+	res, err := be.PushFF(commit, "")
 	if err != nil {
 		return err
 	}

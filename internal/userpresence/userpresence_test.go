@@ -5,6 +5,7 @@ package userpresence
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -22,5 +23,21 @@ func TestRequireNonInteractiveSkips(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "skipped") || !strings.Contains(buf.String(), "unit test") {
 		t.Fatalf("notice = %q, want skip notice naming the operation", buf.String())
+	}
+}
+
+func TestRequireExplicitNonInteractiveFailsClosed(t *testing.T) {
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		t.Skip("stdin is a terminal; non-interactive behavior cannot be exercised")
+	}
+	var buf bytes.Buffer
+	if err := RequireExplicit("accept rollback", &buf, false); !errors.Is(err, ErrNonInteractive) {
+		t.Fatalf("RequireExplicit error = %v, want ErrNonInteractive", err)
+	}
+	if err := RequireExplicit("accept rollback", &buf, true); err != nil {
+		t.Fatalf("explicit non-interactive bypass failed: %v", err)
+	}
+	if !strings.Contains(buf.String(), "skipped") {
+		t.Fatalf("explicit bypass did not emit skip notice: %q", buf.String())
 	}
 }

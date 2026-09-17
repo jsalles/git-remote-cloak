@@ -73,7 +73,15 @@ func TestTreePackBlobsVerifiesReusedBlobCiphertext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	man := &manifest.Manifest{Packs: []manifest.Pack{{ID: packID, Size: 1}}}
+	sizeMismatch := &manifest.Manifest{Packs: []manifest.Pack{{ID: packID, Size: 1}}}
+	if _, err := e.treePackBlobs(commitInput{man: sizeMismatch, blobSource: src}); err == nil {
+		t.Fatal("treePackBlobs reused a pack blob larger than the authenticated manifest size")
+	} else if kind, ok := cloakerr.KindOf(err); !ok || kind != cloakerr.Tamper ||
+		!strings.Contains(err.Error(), "exceeds the authenticated manifest size") {
+		t.Fatalf("reused-blob size mismatch not reported as tamper: %v", err)
+	}
+
+	man := &manifest.Manifest{Packs: []manifest.Pack{{ID: packID, Size: int64(len("tampered-ciphertext"))}}}
 	_, err = e.treePackBlobs(commitInput{man: man, blobSource: src})
 	if err == nil {
 		t.Fatal("treePackBlobs reused a corrupted pack blob without verifying it")

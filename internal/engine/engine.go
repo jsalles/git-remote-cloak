@@ -8,6 +8,7 @@ package engine
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -67,6 +68,42 @@ type RemoteState struct {
 	ManifestHash string
 }
 
+// validateRetryAdvance binds one operation to the authenticated state it has
+// already observed. Durable pins can legitimately lag during first contact or
+// a push-only session, so re-running LoadRemoteState after a lost carrier CAS
+// is not by itself enough: a host must not switch repositories, replay an older
+// generation, present different ciphertext at the same generation, or make a
+// previously observed non-empty carrier disappear mid-operation. An operation
+// that began empty may adopt the non-empty state created by the CAS winner.
+func validateRetryAdvance(operation string, previous, next *RemoteState) error {
+	previousPopulated := previous != nil && previous.Manifest != nil
+	nextPopulated := next != nil && next.Manifest != nil
+	if !nextPopulated {
+		return cloakerr.Newf(cloakerr.Rollback, operation+" retry",
+			"carrier is empty after a lost compare-and-swap; refusing to recreate state across an ambiguous deletion or rewind")
+	}
+	if !previousPopulated {
+		return nil
+	}
+	if next.Manifest.RepoID != previous.Manifest.RepoID {
+		return cloakerr.Newf(cloakerr.Tamper, operation+" retry",
+			"repository identity changed during one operation (%s != %s)", next.Manifest.RepoID, previous.Manifest.RepoID)
+	}
+	switch {
+	case next.Manifest.Generation > previous.Manifest.Generation:
+		return nil
+	case next.Manifest.Generation < previous.Manifest.Generation:
+		return cloakerr.Newf(cloakerr.Rollback, operation+" retry",
+			"remote generation regressed during one operation (%d < %d)", next.Manifest.Generation, previous.Manifest.Generation)
+	case next.ManifestHash != previous.ManifestHash:
+		return cloakerr.Newf(cloakerr.Tamper, operation+" retry",
+			"remote manifest changed without a generation bump during one operation (generation %d)", next.Manifest.Generation)
+	default:
+		return cloakerr.Newf(cloakerr.Rollback, operation+" retry",
+			"carrier head changed without an authenticated generation advance (still generation %d)", next.Manifest.Generation)
+	}
+}
+
 // ciphertextHash returns the SHA-256 hex digest of a manifest ciphertext. It
 // is the value recorded as the rollback pin's ManifestHash, so the read path
 // (LoadRemoteState, which checks the pin) and the write path
@@ -85,26 +122,50 @@ func ciphertextHash(ct []byte) string {
 // a valid manifest while withholding or corrupting its packs cannot move the
 // pin off honest state.
 func (e *Engine) LoadRemoteState() (*RemoteState, error) {
+	rs, err := e.LoadRemoteStateUnchecked()
+	if err != nil {
+		return nil, err
+	}
+	if rs.Manifest == nil {
+		if err := e.St.CheckPin(nil, ""); err != nil {
+			return nil, err
+		}
+		return rs, nil
+	}
+	if err := e.St.CheckPin(rs.Manifest, rs.ManifestHash); err != nil {
+		return nil, err
+	}
+	if err := e.St.CheckRepoID(rs.Manifest); err != nil {
+		return nil, err
+	}
+	e.Log.Info("remote state validated", "generation", rs.Manifest.Generation,
+		"refs", len(rs.Manifest.Refs), "packs", len(rs.Manifest.Packs))
+	return rs, nil
+}
+
+// LoadRemoteStateUnchecked fetches, decrypts, and structurally validates the
+// carrier state without consulting local rollback or repository-identity pins.
+// Only explicit accept-* recovery uses this path, so it can verify a candidate
+// state fully before atomically replacing the old trust anchors. Routine
+// fetch/push must use LoadRemoteState.
+func (e *Engine) LoadRemoteStateUnchecked() (*RemoteState, error) {
 	e.phase("downloading from host")
 	head, empty, err := e.Be.Fetch()
 	if err != nil {
 		return nil, err
 	}
 	if empty {
-		if err := e.St.CheckPin(nil, ""); err != nil {
-			return nil, err
-		}
 		e.Log.Info("remote is empty (no backend branch yet)")
 		return &RemoteState{}, nil
 	}
-	return e.loadPopulatedState(head)
+	return e.loadPopulatedStateUnchecked(head)
 }
 
-// loadPopulatedState reads, decrypts, decodes, and pin/identity-validates the
-// manifest at a non-empty backend head. It is the populated-remote half of
-// LoadRemoteState, split out so the empty-remote short-circuit and this
-// decrypt-and-validate pipeline are each below the complexity threshold.
-func (e *Engine) loadPopulatedState(head string) (*RemoteState, error) {
+// loadPopulatedStateUnchecked reads, decrypts, and structurally validates the
+// manifest at a non-empty backend head. Trust-anchor validation belongs to the
+// ordinary LoadRemoteState caller; explicit acceptance verifies storage before
+// replacing those anchors.
+func (e *Engine) loadPopulatedStateUnchecked(head string) (*RemoteState, error) {
 	ct, err := e.Be.ReadBlobBytes(head, "manifest.age")
 	if err != nil {
 		return nil, err
@@ -127,22 +188,14 @@ func (e *Engine) loadPopulatedState(head string) (*RemoteState, error) {
 			"the remote decrypted correctly but its manifest is not understood by this version; upgrade git-remote-cloak (the other machine may be on a newer format)",
 			"remote manifest invalid: %v", err)
 	}
-	if err := e.St.CheckPin(m, hash); err != nil {
-		return nil, err
-	}
-	if err := e.St.CheckRepoID(m); err != nil {
-		return nil, err
-	}
-	e.Log.Info("remote state validated", "generation", m.Generation,
-		"refs", len(m.Refs), "packs", len(m.Packs))
 	return &RemoteState{Head: head, Manifest: m, ManifestHash: hash}, nil
 }
 
 // CommitPin persists the rollback pin and the repository-identity pin for a
 // remote state that has been fully fetched, verified, and applied. It is the
 // single point at which the local pins advance: callers invoke it only after
-// FetchApply succeeded and every requested object is present, so a host that
-// withholds or corrupts packs never moves the pins. No-op for an empty
+// the complete advertised object closure has been verified; explicit trust
+// changes additionally verify every live remote pack. No-op for an empty
 // remote (no manifest to pin).
 func (e *Engine) CommitPin(rs *RemoteState) error {
 	if rs == nil || rs.Manifest == nil {
@@ -152,6 +205,130 @@ func (e *Engine) CommitPin(rs *RemoteState) error {
 	// pin without its repo-id pin (which would silently revert repo-identity
 	// protection to TOFU); see state.SavePins.
 	return e.St.SavePins(state.Pin{Generation: rs.Manifest.Generation, ManifestHash: rs.ManifestHash}, rs.Manifest.RepoID)
+}
+
+// CommitPinIfComplete repairs missing or stale trust anchors when the local
+// object store already contains the complete closure of every advertised ref.
+// This is the list-only fetch path: Git does not send a fetch batch when it
+// already has the objects, so fetchBatch has no opportunity to call CommitPin.
+//
+// The state is re-validated immediately before any repair. This keeps the
+// operation fail-closed if a pin became corrupt or inconsistent after the
+// RemoteState was loaded, rather than letting the repair overwrite an alarm.
+// Existing current pins are left untouched without walking the object graph.
+// It returns true only when it persisted repaired pins.
+func (e *Engine) CommitPinIfComplete(rs *RemoteState) (bool, error) {
+	if rs == nil || rs.Manifest == nil {
+		return false, nil
+	}
+	if err := e.St.CheckPin(rs.Manifest, rs.ManifestHash); err != nil {
+		return false, err
+	}
+	if err := e.St.CheckRepoID(rs.Manifest); err != nil {
+		return false, err
+	}
+
+	pin, hasPin, err := e.St.LoadPin()
+	if err != nil {
+		return false, fmt.Errorf("inspect rollback pin before repair: %w", err)
+	}
+	repoID, hasRepoID, err := e.St.LoadRepoID()
+	if err != nil {
+		return false, fmt.Errorf("inspect repo-identity pin before repair: %w", err)
+	}
+	if hasPin && pin.Generation == rs.Manifest.Generation && pin.ManifestHash == rs.ManifestHash &&
+		hasRepoID && repoID == rs.Manifest.RepoID {
+		return false, nil
+	}
+
+	tips := manifestRefTips(rs.Manifest)
+	if !e.HasObjectClosure(tips) {
+		return false, nil
+	}
+	if err := e.CommitPin(rs); err != nil {
+		return false, fmt.Errorf("repair pins from complete local objects: %w", err)
+	}
+	return true, nil
+}
+
+// VerifyApplyAndCommitPin establishes trust anchors for an explicitly
+// accepted remote only after proving that every live pack exists and its
+// ciphertext matches the authenticated manifest. A complete local object
+// closure avoids redundant indexing but never skips remote pack verification.
+// When the closure is incomplete, every live pack is applied regardless of
+// the applied set, Replaces lineage, or the usual closure shortcut; this also
+// repairs stale local applied state. The final closure check proves the packs
+// supplied every object reachable from the advertised refs before any pin is
+// persisted.
+func (e *Engine) VerifyApplyAndCommitPin(rs *RemoteState, requireMatchingRepoID bool) error {
+	if rs == nil || rs.Manifest == nil {
+		return nil
+	}
+	if requireMatchingRepoID {
+		if err := e.St.CheckRepoID(rs.Manifest); err != nil {
+			return err
+		}
+	}
+
+	tips := manifestRefTips(rs.Manifest)
+	apply := !e.HasObjectClosure(tips)
+	appliedIDs := make([]string, 0, len(rs.Manifest.Packs))
+	for i, p := range rs.Manifest.Packs {
+		if apply {
+			e.phase("verifying and applying pack %d/%d", i+1, len(rs.Manifest.Packs))
+			if _, err := e.applyPack(rs.Head, p); err != nil {
+				return err
+			}
+			appliedIDs = append(appliedIDs, p.ID)
+			continue
+		}
+		e.phase("verifying pack %d/%d", i+1, len(rs.Manifest.Packs))
+		if err := e.verifyPackWithoutApply(rs.Head, p); err != nil {
+			return err
+		}
+	}
+	if !e.HasObjectClosure(tips) {
+		return cloakerr.New(cloakerr.Tamper, "verify accepted remote",
+			fmt.Errorf("live packs did not provide the complete object closure of every advertised ref"))
+	}
+	if len(appliedIDs) > 0 {
+		if err := e.St.MarkApplied(appliedIDs...); err != nil {
+			return fmt.Errorf("record verified accepted packs: %w", err)
+		}
+	}
+	if err := e.CommitPin(rs); err != nil {
+		return fmt.Errorf("pin verified accepted remote: %w", err)
+	}
+	return nil
+}
+
+// verifyPackWithoutApply downloads one live pack through the same bounded
+// size-and-hash checks as applyPack, but leaves the already-complete local
+// object store untouched.
+func (e *Engine) verifyPackWithoutApply(head string, p manifest.Pack) (retErr error) {
+	ctPath := filepath.Join(e.St.TmpDir(), "verify-pack-"+p.ID[:12]+".age")
+	defer joinScratchRemoval(ctPath, "verified pack ciphertext", &retErr)
+	return e.downloadVerifyPack(head, ctPath, p)
+}
+
+// joinScratchRemoval removes a transient file and attaches cleanup failure to
+// the operation's return error. A missing path is expected when setup failed
+// before creation; every other failure is surfaced so plaintext/ciphertext is
+// never silently left behind.
+func joinScratchRemoval(path, description string, retErr *error) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		*retErr = errors.Join(*retErr, fmt.Errorf("remove %s %q: %w", description, path, err))
+	}
+}
+
+// manifestRefTips returns every object id advertised by m. The order is not
+// security-sensitive; callers pass the complete set to git rev-list.
+func manifestRefTips(m *manifest.Manifest) []string {
+	tips := make([]string, 0, len(m.Refs))
+	for _, oid := range m.Refs {
+		tips = append(tips, oid)
+	}
+	return tips
 }
 
 // HaveObject reports whether the local repository has the object.
@@ -171,8 +348,25 @@ func (e *Engine) HasObjectClosure(oids []string) bool {
 	if len(oids) == 0 {
 		return true
 	}
-	args := append([]string{"rev-list", "--objects", "--missing=print"}, oids...)
-	out, _, err := e.G.Run(gitx.Opts{GitDir: e.LocalGitDir}, args...)
+	shallow, err := e.G.Out(gitx.Opts{GitDir: e.LocalGitDir}, "rev-parse", "--is-shallow-repository")
+	if err != nil || shallow == "true" {
+		return false
+	}
+	// Stream revisions on stdin instead of expanding one argv entry per ref.
+	// A manifest may legitimately advertise enough refs to exceed the OS command
+	// line limit; treating that exec failure as an incomplete closure would make
+	// such a remote impossible to fetch and pin even after all packs were applied.
+	var revs strings.Builder
+	revs.Grow(len(oids) * 41)
+	for _, oid := range oids {
+		revs.WriteString(oid)
+		revs.WriteByte('\n')
+	}
+	out, _, err := e.G.Run(gitx.Opts{
+		GitDir: e.LocalGitDir,
+		Env:    []string{"GIT_NO_REPLACE_OBJECTS=1"},
+		Stdin:  strings.NewReader(revs.String()),
+	}, "rev-list", "--objects", "--missing=print", "--stdin")
 	if err != nil {
 		return false
 	}
@@ -311,22 +505,82 @@ func (e *Engine) lazyClosure(refs map[string]string) func() bool {
 // the host serving bad data rather than a wrong key.
 const packTamperHint = "the manifest decrypted under this key but this pack did not, so the key is correct; the host likely served corrupted or tampered pack data. Re-fetch and check the debug log"
 
+var errPackExceedsRecordedSize = errors.New("pack blob exceeds size recorded in manifest")
+
+// exactSizeWriter streams at most expected bytes to dst and records the exact
+// byte count. It stops the producer on the first excess byte instead of first
+// writing an attacker-controlled blob of unbounded size to scratch storage.
+type exactSizeWriter struct {
+	dst      io.Writer
+	expected int64
+	written  int64
+	overflow bool
+}
+
+func (w *exactSizeWriter) Write(p []byte) (int, error) {
+	remaining := w.expected - w.written
+	if remaining <= 0 {
+		w.overflow = len(p) > 0
+		return 0, errPackExceedsRecordedSize
+	}
+	if int64(len(p)) > remaining {
+		n, err := w.dst.Write(p[:remaining])
+		w.written += int64(n)
+		w.overflow = true
+		if err != nil {
+			return n, err
+		}
+		if int64(n) != remaining {
+			return n, io.ErrShortWrite
+		}
+		return n, errPackExceedsRecordedSize
+	}
+	n, err := w.dst.Write(p)
+	w.written += int64(n)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	return n, err
+}
+
 // downloadVerifyPack downloads packs/<id>.age from the backend commit head
 // into ctPath, hashing the ciphertext as it streams, and fails if the hash
 // does not match the manifest pack id (the host served corrupted or tampered
 // data, since the key is already proven correct by the manifest decrypt).
 func (e *Engine) downloadVerifyPack(head, ctPath string, p manifest.Pack) error {
+	if e.Cfg.MaxPackBytes > 0 && p.Size > e.Cfg.MaxPackBytes {
+		return cloakerr.Newfh(cloakerr.TooLarge, "download pack "+p.ID[:12],
+			"raise `git config cloak.maxPackBytes <bytes>` only after confirming this remote intentionally contains a pack of that size",
+			"manifest records %d bytes, exceeding the local receive limit of %d", p.Size, e.Cfg.MaxPackBytes)
+	}
 	f, err := os.OpenFile(ctPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) // #nosec G304 -- ctPath is TmpDir()+content-addressed name (pack id is 64-hex, manifest.Validate); no untrusted path component
 	if err != nil {
 		return fmt.Errorf("create pack ciphertext scratch file %q: %w", ctPath, err)
 	}
 	hasher := sha256.New()
-	if err := e.Be.ReadBlob(head, "packs/"+p.ID+".age", io.MultiWriter(f, hasher)); err != nil {
-		_ = f.Close()
-		return err
+	exact := &exactSizeWriter{dst: io.MultiWriter(f, hasher), expected: p.Size}
+	readErr := e.Be.ReadBlob(head, "packs/"+p.ID+".age", exact)
+	if exact.overflow || errors.Is(readErr, errPackExceedsRecordedSize) {
+		closeErr := f.Close()
+		tamperErr := cloakerr.Newf(cloakerr.Tamper, "verify pack "+p.ID[:12],
+			"remote blob exceeds the authenticated manifest size of %d bytes", p.Size).WithHint(packTamperHint)
+		if closeErr != nil {
+			return errors.Join(tamperErr, fmt.Errorf("close pack ciphertext scratch file %q: %w", ctPath, closeErr))
+		}
+		return tamperErr
+	}
+	if readErr != nil {
+		if closeErr := f.Close(); closeErr != nil {
+			return errors.Join(readErr, fmt.Errorf("close pack ciphertext scratch file %q: %w", ctPath, closeErr))
+		}
+		return readErr
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close pack ciphertext scratch file %q: %w", ctPath, err)
+	}
+	if exact.written != p.Size {
+		return cloakerr.Newf(cloakerr.Tamper, "verify pack "+p.ID[:12],
+			"remote blob is %d bytes but the authenticated manifest records %d", exact.written, p.Size).WithHint(packTamperHint)
 	}
 	if got := hex.EncodeToString(hasher.Sum(nil)); got != p.ID {
 		return cloakerr.Newf(cloakerr.Tamper, "verify pack "+p.ID[:12],
@@ -346,14 +600,29 @@ func (e *Engine) downloadVerifyPack(head, ctPath string, p manifest.Pack) error 
 // ReadBlob streams into the hasher, so memory stays bounded regardless of pack
 // size; the cost is re-reading reused live packs (local I/O, bounded by
 // geometric consolidation keeping the live-pack count ~log(pushes)).
-func (e *Engine) verifyReusedPackBlob(commit, id string) error {
-	hasher := sha256.New()
-	if err := e.Be.ReadBlob(commit, "packs/"+id+".age", hasher); err != nil {
-		return err
+func (e *Engine) verifyReusedPackBlob(commit string, p manifest.Pack) error {
+	if e.Cfg.MaxPackBytes > 0 && p.Size > e.Cfg.MaxPackBytes {
+		return cloakerr.Newfh(cloakerr.TooLarge, "verify reused pack "+p.ID[:12],
+			"raise `git config cloak.maxPackBytes <bytes>` only after confirming this remote intentionally contains a pack of that size",
+			"manifest records %d bytes, exceeding the local receive limit of %d", p.Size, e.Cfg.MaxPackBytes)
 	}
-	if got := hex.EncodeToString(hasher.Sum(nil)); got != id {
-		return cloakerr.Newf(cloakerr.Tamper, "verify reused pack "+id[:12],
-			"ciphertext hash %s does not match manifest id %s", got, id).WithHint(packTamperHint)
+	hasher := sha256.New()
+	exact := &exactSizeWriter{dst: hasher, expected: p.Size}
+	readErr := e.Be.ReadBlob(commit, "packs/"+p.ID+".age", exact)
+	if exact.overflow || errors.Is(readErr, errPackExceedsRecordedSize) {
+		return cloakerr.Newf(cloakerr.Tamper, "verify reused pack "+p.ID[:12],
+			"remote blob exceeds the authenticated manifest size of %d bytes", p.Size).WithHint(packTamperHint)
+	}
+	if readErr != nil {
+		return readErr
+	}
+	if exact.written != p.Size {
+		return cloakerr.Newf(cloakerr.Tamper, "verify reused pack "+p.ID[:12],
+			"remote blob is %d bytes but the authenticated manifest records %d", exact.written, p.Size).WithHint(packTamperHint)
+	}
+	if got := hex.EncodeToString(hasher.Sum(nil)); got != p.ID {
+		return cloakerr.Newf(cloakerr.Tamper, "verify reused pack "+p.ID[:12],
+			"ciphertext hash %s does not match manifest id %s", got, p.ID).WithHint(packTamperHint)
 	}
 	return nil
 }
@@ -364,8 +633,8 @@ func (e *Engine) applyPack(head string, p manifest.Pack) (keepFile string, err e
 	short := p.ID[:12]
 	ctPath := filepath.Join(e.St.TmpDir(), "pack-"+short+".age")
 	ptPath := filepath.Join(e.St.TmpDir(), "pack-"+short+".pack")
-	defer func() { _ = os.Remove(ctPath) }()
-	defer func() { _ = os.Remove(ptPath) }()
+	defer joinScratchRemoval(ctPath, "pack ciphertext", &err)
+	defer joinScratchRemoval(ptPath, "decrypted pack", &err)
 
 	if err := e.downloadVerifyPack(head, ctPath, p); err != nil {
 		return "", err
@@ -378,12 +647,16 @@ func (e *Engine) applyPack(head string, p manifest.Pack) (keepFile string, err e
 
 // decryptPackTo decrypts the age ciphertext at ctPath and writes the
 // plaintext pack to ptPath, classifying AEAD failures as Tamper.
-func (e *Engine) decryptPackTo(ctPath, ptPath string) error {
+func (e *Engine) decryptPackTo(ctPath, ptPath string) (retErr error) {
 	ct, err := os.Open(ctPath) // #nosec G304 -- ctPath is TmpDir()+content-addressed name (pack id is 64-hex, manifest.Validate); no untrusted path component
 	if err != nil {
 		return fmt.Errorf("open pack ciphertext scratch file %q: %w", ctPath, err)
 	}
-	defer func() { _ = ct.Close() }()
+	defer func() {
+		if err := ct.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close pack ciphertext scratch file %q: %w", ctPath, err))
+		}
+	}()
 	plain, err := agecrypt.Decrypt(ct, e.Key)
 	if err != nil {
 		return cloakerr.WithHintOn(err, packTamperHint)
@@ -393,8 +666,8 @@ func (e *Engine) decryptPackTo(ctPath, ptPath string) error {
 		return fmt.Errorf("create pack plaintext scratch file %q: %w", ptPath, err)
 	}
 	if _, err := io.Copy(ptFile, plain); err != nil {
-		_ = ptFile.Close()
-		return cloakerr.WithHintOn(err, packTamperHint) // Tamper-classified by agecrypt on AEAD failure
+		closeErr := ptFile.Close()
+		return errors.Join(cloakerr.WithHintOn(err, packTamperHint), closeErr) // Tamper-classified by agecrypt on AEAD failure
 	}
 	if err := ptFile.Close(); err != nil {
 		return fmt.Errorf("close pack plaintext scratch file %q: %w", ptPath, err)
@@ -409,7 +682,11 @@ func (e *Engine) indexPackFile(ptPath, short string, size int64) (keepFile strin
 	if err != nil {
 		return "", fmt.Errorf("open pack plaintext scratch file %q: %w", ptPath, err)
 	}
-	defer func() { _ = pt.Close() }()
+	defer func() {
+		if closeErr := pt.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close pack plaintext scratch file %q: %w", ptPath, closeErr))
+		}
+	}()
 	out, _, err := e.G.Run(gitx.Opts{GitDir: e.LocalGitDir, Stdin: pt},
 		"index-pack", "--stdin", "--keep=cloak")
 	if err != nil {

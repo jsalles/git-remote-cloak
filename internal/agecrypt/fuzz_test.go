@@ -269,8 +269,11 @@ func FuzzUnwrapStanza(f *testing.F) {
 			t.Fatalf("unwrapped despite malformed salt arg %q (decode err %v, len %d, want %d)",
 				saltArg, err, len(salt), saltSize)
 		}
-		if fileKey == nil {
-			t.Fatalf("successful unwrap returned a nil file key")
+		if len(s.Body) != wrappedFileKeySize {
+			t.Fatalf("unwrapped a %d-byte body, want %d", len(s.Body), wrappedFileKeySize)
+		}
+		if len(fileKey) != ageFileKeySize {
+			t.Fatalf("successful unwrap returned a %d-byte file key, want %d", len(fileKey), ageFileKeySize)
 		}
 	})
 }
@@ -285,16 +288,18 @@ func FuzzUnwrapStanza(f *testing.F) {
 // buried inside the full age framing, so the hand-written seal path is never
 // exercised over arbitrary file-key bytes in isolation -- the same reason
 // tryUnwrapStanza warranted its own direct fuzz target. The pinned invariants:
-// for any master key and any file-key bytes, Wrap must emit exactly one cloak
-// stanza carrying a single well-formed saltSize-byte base64 salt, Unwrap under
-// the wrapping key must return the identical file key, and Unwrap under a
-// distinct key must fail closed (an error, never the file key). When the two
-// seeds pad/truncate to the same key bytes the keys are equal, so that case is
-// really the same-key round trip and must instead succeed.
+// for any master key and an ageFileKeySize-byte file key, Wrap must emit
+// exactly one cloak stanza carrying a single well-formed saltSize-byte base64
+// salt and wrappedFileKeySize-byte body. Any other file-key length must be
+// rejected. Unwrap under the wrapping key must return the identical file key,
+// and Unwrap under a distinct key must fail closed (an error, never the file
+// key). When the two seeds pad/truncate to the same key bytes the keys are
+// equal, so that case is really the same-key round trip and must instead
+// succeed.
 func FuzzStanzaWrapRoundTrip(f *testing.F) {
 	f.Add([]byte("master-A"), []byte("master-B"), []byte("0123456789abcdef")) // 16-byte file key, age's shape
-	f.Add([]byte("same"), []byte("same"), []byte("equal keys must unwrap"))   // equal keys: a round trip
-	f.Add([]byte(""), []byte{0}, []byte(""))                                  // "" and {0} pad to the all-zero key
+	f.Add([]byte("same"), []byte("same"), []byte("equal-key-round!"))         // equal keys: a round trip
+	f.Add([]byte(""), []byte{0}, []byte(""))                                  // invalid file-key length is rejected
 	f.Add(bytes.Repeat([]byte{1}, keystore.KeySize), bytes.Repeat([]byte{2}, keystore.KeySize), bytes.Repeat([]byte{0xAB}, 64))
 
 	f.Fuzz(func(t *testing.T, seedA, seedB, fileKey []byte) {
@@ -302,6 +307,15 @@ func FuzzStanzaWrapRoundTrip(f *testing.F) {
 		kb := fuzzKey(seedB)
 
 		stanzas, err := recipient{ka}.Wrap(fileKey)
+		if len(fileKey) != ageFileKeySize {
+			if err == nil {
+				t.Fatalf("Wrap of %d-byte file key succeeded, want rejection", len(fileKey))
+			}
+			if stanzas != nil {
+				t.Fatalf("Wrap of %d-byte file key returned %d stanzas on error", len(fileKey), len(stanzas))
+			}
+			return
+		}
 		if err != nil {
 			t.Fatalf("Wrap of %d-byte file key failed: %v", len(fileKey), err)
 		}
@@ -322,6 +336,9 @@ func FuzzStanzaWrapRoundTrip(f *testing.F) {
 		if derr != nil || len(salt) != saltSize {
 			t.Fatalf("Wrap produced malformed salt arg %q (decode err %v, len %d, want %d)",
 				st.Args[0], derr, len(salt), saltSize)
+		}
+		if len(st.Body) != wrappedFileKeySize {
+			t.Fatalf("Wrap produced %d-byte stanza body, want %d", len(st.Body), wrappedFileKeySize)
 		}
 
 		// The wrapping key must recover the exact file-key bytes.
@@ -963,7 +980,9 @@ func FuzzUnwrapStanzaList(f *testing.F) {
 		for i, k := range kinds {
 			// Distinct leading index byte so each openable stanza recovers a
 			// distinct key; this is what makes "first openable wins" a real check.
-			fk := append([]byte{byte(i)}, fkSeed...)
+			fk := make([]byte, ageFileKeySize)
+			fk[0] = byte(i)
+			copy(fk[1:], fkSeed)
 			ss, err := rcpt.Wrap(fk)
 			if err != nil || len(ss) != 1 {
 				t.Fatalf("Wrap(stanza %d) returned (len %d, err %v), want exactly one stanza", i, len(ss), err)

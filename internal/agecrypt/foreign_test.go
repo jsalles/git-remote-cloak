@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"filippo.io/age"
+	"golang.org/x/crypto/chacha20poly1305"
 
 	"github.com/b4ryon/git-remote-cloak/internal/cloakerr"
 )
@@ -59,12 +60,72 @@ func TestUnwrapSkipsMalformedStanzas(t *testing.T) {
 		{"too many args", []*age.Stanza{{Type: StanzaType, Args: []string{goodSalt, "extra"}, Body: []byte("x")}}},
 		{"non-base64 salt", []*age.Stanza{{Type: StanzaType, Args: []string{"!!!not base64!!!"}, Body: []byte("x")}}},
 		{"short salt", []*age.Stanza{{Type: StanzaType, Args: []string{base64.RawStdEncoding.EncodeToString([]byte("tooshort"))}, Body: []byte("x")}}},
+		{"short body", []*age.Stanza{{Type: StanzaType, Args: []string{goodSalt}, Body: make([]byte, wrappedFileKeySize-1)}}},
+		{"long body", []*age.Stanza{{Type: StanzaType, Args: []string{goodSalt}, Body: make([]byte, wrappedFileKeySize+1)}}},
 		{"no stanzas", nil},
 	}
 	for _, c := range cases {
 		_, err := id.Unwrap(c.stanzas)
 		if !errors.Is(err, age.ErrIncorrectIdentity) {
 			t.Errorf("%s: Unwrap returned %v, want ErrIncorrectIdentity", c.name, err)
+		}
+	}
+}
+
+func TestWrapRejectsWrongFileKeyLength(t *testing.T) {
+	r := recipient{master: testKey(t)}
+	for _, size := range []int{0, ageFileKeySize - 1, ageFileKeySize + 1, 64} {
+		stanzas, err := r.Wrap(make([]byte, size))
+		if err == nil {
+			t.Errorf("Wrap(%d-byte file key) succeeded, want error", size)
+		}
+		if stanzas != nil {
+			t.Errorf("Wrap(%d-byte file key) returned %d stanzas on error", size, len(stanzas))
+		}
+	}
+}
+
+func TestUnwrapRejectsAuthenticatedWrongFileKeyLength(t *testing.T) {
+	master := testKey(t)
+	id := identity{master: master}
+	for n, size := range []int{0, ageFileKeySize - 1, ageFileKeySize, ageFileKeySize + 1, 64} {
+		// Build the malformed stanza below the recipient boundary. An authorized
+		// but buggy writer can authenticate any plaintext length, so Unwrap must
+		// enforce age's fixed file-key size rather than relying on AEAD alone.
+		salt := make([]byte, saltSize)
+		salt[0] = byte(n + 1)
+		wk, nonce, err := deriveWrapKey(master, salt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		aead, err := chacha20poly1305.New(wk)
+		if err != nil {
+			zero(wk)
+			t.Fatal(err)
+		}
+		want := make([]byte, size)
+		stanza := &age.Stanza{
+			Type: StanzaType,
+			Args: []string{base64.RawStdEncoding.EncodeToString(salt)},
+			Body: aead.Seal(nil, nonce, want, nil),
+		}
+		zero(wk)
+
+		got, err := id.Unwrap([]*age.Stanza{stanza})
+		if size != ageFileKeySize {
+			if !errors.Is(err, age.ErrIncorrectIdentity) {
+				t.Errorf("Unwrap authenticated %d-byte file key = %v, want ErrIncorrectIdentity", size, err)
+			}
+			if got != nil {
+				t.Errorf("Unwrap authenticated %d-byte file key returned %d bytes on error", size, len(got))
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("Unwrap authenticated valid file key: %v", err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("Unwrap authenticated valid file key = %x, want %x", got, want)
 		}
 	}
 }

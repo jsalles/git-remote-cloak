@@ -8,6 +8,7 @@ package engine
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -65,9 +66,11 @@ type pushAttempt struct {
 // lost compare-and-swap, retries against the re-fetched state until PushRetries
 // is exhausted.
 func (e *Engine) Push(rs *RemoteState, updates []RefUpdate, dryRun bool) ([]RefResult, *RemoteState, error) {
+	updates = e.freezeUpdateSources(updates)
+	advertised := advertisedDestinations(rs, updates)
 	cur := rs
 	for attempt := 0; attempt <= e.Cfg.PushRetries; attempt++ {
-		a, err := e.pushOnce(cur, updates, dryRun, attempt)
+		a, err := e.pushOnce(cur, updates, advertised, dryRun, attempt)
 		if err != nil {
 			return nil, cur, err
 		}
@@ -81,18 +84,45 @@ func (e *Engine) Push(rs *RemoteState, updates []RefUpdate, dryRun bool) ([]RefR
 		"lost the compare-and-swap race %d times in a row; remote is under heavy concurrent pushing", e.Cfg.PushRetries+1)
 }
 
+// freezeUpdateSources resolves every non-delete source once, before the first
+// carrier attempt. Git's push transaction is defined by the objects advertised
+// when it starts; a concurrently moving local branch must not silently change
+// what a later CAS retry publishes. Unresolvable sources remain unchanged so
+// the normal per-ref error path retains responsibility for reporting them.
+func (e *Engine) freezeUpdateSources(updates []RefUpdate) []RefUpdate {
+	frozen := append([]RefUpdate(nil), updates...)
+	for i := range frozen {
+		if frozen[i].Src == "" {
+			continue
+		}
+		if oid, err := e.G.Out(gitx.Opts{GitDir: e.LocalGitDir}, "rev-parse", "--verify", frozen[i].Src); err == nil {
+			frozen[i].Src = oid
+		}
+	}
+	return frozen
+}
+
 // pushOnce runs a single push attempt against cur: plan the refs, optionally
 // consolidate, build and execute the backend commit, then resolve the result.
 // It reports done=true with the final results/state when the push resolves
 // (accepted, no-op, or dry-run), or done=false with the re-fetched state when
 // the compare-and-swap is lost so the caller can retry.
-func (e *Engine) pushOnce(cur *RemoteState, updates []RefUpdate, dryRun bool, attempt int) (pushAttempt, error) {
-	results, plan, err := e.preparePush(cur, updates)
+func (e *Engine) pushOnce(cur *RemoteState, updates []RefUpdate, advertised map[string]advertisedRef, dryRun bool, attempt int) (pushAttempt, error) {
+	results, plan, err := e.preparePush(cur, updates, advertised, attempt > 0)
 	if err != nil {
 		return pushAttempt{}, err
 	}
 	if plan == nil {
 		// Nothing was accepted (every ref rejected or a pure no-op).
+		// After a carrier CAS loss, the re-fetched state may already contain the
+		// exact requested result. Repair its trust anchors when the complete object
+		// closure is local; otherwise this successful no-op would leave the client
+		// pinned behind the state it just accepted.
+		if attempt > 0 {
+			if _, err := e.CommitPinIfComplete(cur); err != nil {
+				return pushAttempt{}, err
+			}
+		}
 		return pushAttempt{results: results, state: cur, done: true}, nil
 	}
 	if dryRun {
@@ -116,7 +146,7 @@ func (e *Engine) pushOnce(cur *RemoteState, updates []RefUpdate, dryRun bool, at
 	case backend.PushOK:
 		return e.acceptPush(results, plan, bc, updates, attempt)
 	case backend.PushCASLost:
-		return e.retryAfterCASLost(attempt)
+		return e.retryAfterCASLost(attempt, cur)
 	}
 	return pushAttempt{state: cur, done: false}, nil
 }
@@ -137,13 +167,16 @@ func (e *Engine) acceptPush(results []RefResult, plan *pushPlan, bc builtCommit,
 // remote state and returns a not-done attempt so the Push loop retries the next
 // attempt against it. The per-attempt results are recomputed on the next
 // iteration, so they are not carried forward here.
-func (e *Engine) retryAfterCASLost(attempt int) (pushAttempt, error) {
+func (e *Engine) retryAfterCASLost(attempt int, previous *RemoteState) (pushAttempt, error) {
 	// Warn (not Info) so the user sees progress on stderr: a contended push
 	// otherwise looks like a silent hang while it retries.
 	e.Log.Warn("compare-and-swap lost; re-fetching and retrying", "attempt", attempt)
 	e.phase("remote changed, retrying")
 	next, err := e.LoadRemoteState()
 	if err != nil {
+		return pushAttempt{}, err
+	}
+	if err := validateRetryAdvance("push", previous, next); err != nil {
 		return pushAttempt{}, err
 	}
 	return pushAttempt{state: next, done: false}, nil
@@ -172,10 +205,11 @@ func (e *Engine) maybeConsolidate(cur *RemoteState, plan *pushPlan) (squash bool
 			"victims", len(victims), "predicted_bytes", sumPackSizes(victims), "limit", e.Cfg.MaxPackBytes)
 		return false, nil
 	}
-	if err := e.consolidate(cur, plan, victims); err != nil {
+	consolidated, err := e.consolidate(cur, plan, victims)
+	if err != nil {
 		return false, err
 	}
-	return true, nil
+	return consolidated, nil
 }
 
 // commitAndExecute assembles the backend commit for plan and pushes it. A
@@ -206,7 +240,11 @@ func (e *Engine) commitAndExecute(cur *RemoteState, plan *pushPlan, squash bool,
 		res, err := e.Be.PushLease(bc.commit, cur.Head)
 		return res, bc, err
 	}
-	res, err := e.Be.PushFF(bc.commit)
+	expectedOldOID := ""
+	if cur != nil {
+		expectedOldOID = cur.Head
+	}
+	res, err := e.Be.PushFF(bc.commit, expectedOldOID)
 	return res, bc, err
 }
 
@@ -269,7 +307,7 @@ func (p *pushPlan) abort() {
 // preparePush makes the per-ref decisions against cur and assembles the new
 // manifest plus the encrypted pack of missing objects. plan==nil means no
 // ref update was accepted.
-func (e *Engine) preparePush(cur *RemoteState, updates []RefUpdate) ([]RefResult, *pushPlan, error) {
+func (e *Engine) preparePush(cur *RemoteState, updates []RefUpdate, advertised map[string]advertisedRef, afterCASLoss bool) ([]RefResult, *pushPlan, error) {
 	var curMan *manifest.Manifest
 	if cur != nil {
 		curMan = cur.Manifest
@@ -279,9 +317,14 @@ func (e *Engine) preparePush(cur *RemoteState, updates []RefUpdate) ([]RefResult
 		remoteRefs = curMan.Refs
 	}
 
-	results, newRefs, wants, accepted := e.planRefUpdates(remoteRefs, updates)
+	results, newRefs, wants, accepted := e.planRefUpdatesGuarded(remoteRefs, updates, advertised, afterCASLoss)
 	if accepted == 0 {
 		return results, nil, nil
+	}
+	if curMan != nil {
+		if _, err := nextManifestGeneration("push", curMan.Generation); err != nil {
+			return results, nil, err
+		}
 	}
 
 	plan, err := e.buildPlanPack(wants, remoteRefs)
@@ -299,13 +342,55 @@ func (e *Engine) preparePush(cur *RemoteState, updates []RefUpdate) ([]RefResult
 // (remoteRefs plus accepted creates/updates minus accepted deletes), the oids
 // to pack as wants, and the count of accepted updates.
 func (e *Engine) planRefUpdates(remoteRefs map[string]string, updates []RefUpdate) (results []RefResult, newRefs map[string]string, wants []string, accepted int) {
+	return e.planRefUpdatesGuarded(remoteRefs, updates, nil, false)
+}
+
+// advertisedRef is one destination's state in the manifest Git originally
+// saw before Push attempt zero. Existence is kept separately because an absent
+// ref and a (malformed) present ref with an empty oid must not compare equal.
+type advertisedRef struct {
+	oid    string
+	exists bool
+}
+
+// advertisedDestinations snapshots only the refs this push may mutate. The
+// snapshot remains fixed across carrier-CAS retries: a force flag or delete is
+// authorization against the advertised destination, not against whichever tip
+// happens to be current after another client wins the race.
+func advertisedDestinations(rs *RemoteState, updates []RefUpdate) map[string]advertisedRef {
+	refs := map[string]string{}
+	if rs != nil && rs.Manifest != nil {
+		refs = rs.Manifest.Refs
+	}
+	advertised := make(map[string]advertisedRef, len(updates))
+	for _, u := range updates {
+		oid, exists := refs[u.Dst]
+		advertised[u.Dst] = advertisedRef{oid: oid, exists: exists}
+	}
+	return advertised
+}
+
+// planRefUpdatesGuarded is planRefUpdates with the retry-time stale-ref gate.
+// On attempt zero the gate is disabled. After a lost carrier CAS, every update
+// is still evaluated against the newly fetched manifest, but a destination
+// that no longer matches its original advertisement may only resolve as an
+// already-at-desired no-op; otherwise it is rejected as stale. Updates to refs
+// untouched by the winner remain eligible, which preserves disjoint-ref merge.
+func (e *Engine) planRefUpdatesGuarded(remoteRefs map[string]string, updates []RefUpdate, advertised map[string]advertisedRef, afterCASLoss bool) (results []RefResult, newRefs map[string]string, wants []string, accepted int) {
 	results = make([]RefResult, 0, len(updates))
 	newRefs = map[string]string{}
 	for k, v := range remoteRefs {
 		newRefs[k] = v
 	}
 	for _, u := range updates {
-		res, ok, del, setOID := e.decideRef(u, remoteRefs)
+		var res RefResult
+		var ok, del bool
+		var setOID string
+		if afterCASLoss {
+			res, ok, del, setOID = e.decideRefAfterCAS(u, remoteRefs, advertised[u.Dst])
+		} else {
+			res, ok, del, setOID = e.decideRef(u, remoteRefs)
+		}
 		results = append(results, res)
 		if !ok {
 			continue
@@ -319,6 +404,34 @@ func (e *Engine) planRefUpdates(remoteRefs map[string]string, updates []RefUpdat
 		}
 	}
 	return results, newRefs, wants, accepted
+}
+
+// decideRefAfterCAS applies the original-advertisement lease for one ref after
+// a carrier CAS loss. A concurrent writer that already produced exactly the
+// requested state is success without a new manifest generation; every other
+// same-destination change is stale. When the destination is unchanged, normal
+// fast-forward/force/delete rules still apply against the fresh manifest.
+func (e *Engine) decideRefAfterCAS(u RefUpdate, remoteRefs map[string]string, advertised advertisedRef) (res RefResult, accepted, del bool, setOID string) {
+	currentOID, currentExists := remoteRefs[u.Dst]
+	if advertised.exists == currentExists && (!currentExists || advertised.oid == currentOID) {
+		return e.decideRef(u, remoteRefs)
+	}
+
+	if u.Src == "" {
+		if !currentExists {
+			return RefResult{u.Dst, ""}, false, false, ""
+		}
+		return RefResult{u.Dst, "stale info"}, false, false, ""
+	}
+
+	_, refOID, reason := e.resolveRefUpdate(u)
+	if reason != "" {
+		return RefResult{u.Dst, reason}, false, false, ""
+	}
+	if currentExists && currentOID == refOID {
+		return RefResult{u.Dst, ""}, false, false, ""
+	}
+	return RefResult{u.Dst, "stale info"}, false, false, ""
 }
 
 // buildPlanPack creates a fresh pushPlan and, when there are wants, encrypts the
@@ -356,7 +469,11 @@ func (e *Engine) assembleManifest(curMan *manifest.Manifest, newRefs map[string]
 		e.Log.Warn("creating a new cloak backend on this remote; ensure the host repository is PRIVATE (cloak hides contents, not the repo's existence/name/owner or push timing and sizes)",
 			"url", e.Be.URL())
 	}
-	man := nextPushManifest(base, newRefs, e.headForManifest(curMan, newRefs), plan.packs)
+	man, err := nextPushManifest(base, newRefs, e.headForManifest(curMan, newRefs), plan.packs)
+	if err != nil {
+		plan.abort()
+		return err
+	}
 	if err := man.Validate(); err != nil {
 		plan.abort()
 		return fmt.Errorf("constructed manifest invalid (bug): %w", err)
@@ -373,16 +490,32 @@ func (e *Engine) assembleManifest(curMan *manifest.Manifest, newRefs map[string]
 // every pack base already carried (in order): a normal push adds a pack, it
 // never drops a live one, so clients keep access to the objects those packs
 // hold. This is the normal-push counterpart to repackManifest, which instead
-// replaces the whole pack set with a single merged pack.
-func nextPushManifest(base *manifest.Manifest, newRefs map[string]string, head string, packs []plannedPack) *manifest.Manifest {
+// replaces the whole pack set with a bounded replacement pack set.
+func nextPushManifest(base *manifest.Manifest, newRefs map[string]string, head string, packs []plannedPack) (*manifest.Manifest, error) {
+	generation, err := nextManifestGeneration("push", base.Generation)
+	if err != nil {
+		return nil, err
+	}
 	man := base.Clone()
-	man.Generation++
+	man.Generation = generation
 	man.Refs = newRefs
 	man.Head = head
 	for _, p := range packs {
 		man.Packs = append(man.Packs, manifest.Pack{ID: p.id, Size: p.size})
 	}
-	return man
+	return man, nil
+}
+
+// nextManifestGeneration advances the authenticated monotonic counter without
+// wrapping. Publishing generation zero after MaxUint64 would erase the local
+// high-water mark and defeat rollback detection, so exhaustion fails closed.
+func nextManifestGeneration(operation string, current uint64) (uint64, error) {
+	if current == ^uint64(0) {
+		return 0, cloakerr.Newfh(cloakerr.Protocol, operation,
+			"migrate to a fresh carrier repository; the authenticated generation counter cannot be reset safely in place",
+			"remote generation counter is exhausted; refusing to wrap to zero")
+	}
+	return current + 1, nil
 }
 
 // decideRef evaluates one push refspec against the current remote refs without
@@ -399,19 +532,31 @@ func (e *Engine) decideRef(u RefUpdate, remoteRefs map[string]string) (res RefRe
 		}
 		return RefResult{u.Dst, ""}, true, true, ""
 	}
-	oid, err := e.G.Out(gitx.Opts{GitDir: e.LocalGitDir}, "rev-parse", "--verify", u.Src+"^{}")
-	if err != nil {
-		return RefResult{u.Dst, "cannot resolve " + u.Src + " to a commit"}, false, false, ""
-	}
-	// For annotated tags push the tag object itself, not the peel.
-	refOID, err := e.G.Out(gitx.Opts{GitDir: e.LocalGitDir}, "rev-parse", "--verify", u.Src)
-	if err != nil {
-		return RefResult{u.Dst, "cannot resolve ref " + u.Src}, false, false, ""
+	oid, refOID, reason := e.resolveRefUpdate(u)
+	if reason != "" {
+		return RefResult{u.Dst, reason}, false, false, ""
 	}
 	if reason := e.nonFastForwardReason(u, remoteRefs, oid, refOID); reason != "" {
 		return RefResult{u.Dst, reason}, false, false, ""
 	}
 	return RefResult{u.Dst, ""}, true, false, refOID
+}
+
+// resolveRefUpdate resolves both forms needed to publish a non-delete update:
+// oid is the peeled object used for ancestry checks, while refOID preserves an
+// annotated tag object itself for the manifest. reason is the stable per-ref
+// protocol error returned when either resolution fails.
+func (e *Engine) resolveRefUpdate(u RefUpdate) (oid, refOID, reason string) {
+	oid, err := e.G.Out(gitx.Opts{GitDir: e.LocalGitDir}, "rev-parse", "--verify", u.Src+"^{}")
+	if err != nil {
+		return "", "", "cannot resolve " + u.Src + " to a commit"
+	}
+	// For annotated tags push the tag object itself, not the peel.
+	refOID, err = e.G.Out(gitx.Opts{GitDir: e.LocalGitDir}, "rev-parse", "--verify", u.Src)
+	if err != nil {
+		return "", "", "cannot resolve ref " + u.Src
+	}
+	return oid, refOID, ""
 }
 
 // fastForwardExempt reports whether publishing refOID over the remote's current
@@ -470,6 +615,9 @@ type builtPack struct {
 	path  string
 	size  int64
 	count uint32
+	// overLimit means the bounded streaming writer stopped before materializing
+	// a full ciphertext file. size is then the smallest known size (limit+1).
+	overLimit bool
 }
 
 // buildPacks builds the encrypted pack(s) for wants (minus the remote's haves).
@@ -482,39 +630,55 @@ type builtPack struct {
 // naming that file.
 func (e *Engine) buildPacks(wants []string, remoteRefs map[string]string) ([]plannedPack, error) {
 	stdin, haves := e.buildPackRevs(wants, remoteRefs)
-	bp, err := e.buildSinglePack(stdin)
+	bp, err := e.buildSinglePack(stdin, e.Key, "push")
 	if err != nil {
 		return nil, err
 	}
+	budget := splitBudget(e.Cfg.MaxPackBytes)
+	if bp.overLimit {
+		if budget == 0 {
+			return nil, e.checkPackLimit("push", bp.size, wants, haves)
+		}
+		return e.splitEncryptPacks(stdin, wants, budget, e.Key, "push")
+	}
 	if bp.count == 0 {
 		if bp.path != "" {
-			_ = os.Remove(bp.path)
+			if err := os.Remove(bp.path); err != nil && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("remove empty encrypted push pack %q: %w", bp.path, err)
+			}
 		}
 		return nil, nil
 	}
-	budget := splitBudget(e.Cfg.MaxPackBytes)
 	if e.Cfg.MaxPackBytes <= 0 || bp.size <= e.Cfg.MaxPackBytes || budget == 0 {
 		// The single pack fits, the limit is disabled, or the limit is too small
 		// to split: keep the streamed pack but still enforce the limit (a tiny
 		// limit that cannot be split must still refuse an over-limit single pack).
 		if err := e.checkPackLimit("push", bp.size, wants, haves); err != nil {
-			_ = os.Remove(bp.path)
+			if removeErr := os.Remove(bp.path); removeErr != nil && !os.IsNotExist(removeErr) {
+				return nil, errors.Join(err, fmt.Errorf("remove over-limit encrypted push pack %q: %w", bp.path, removeErr))
+			}
 			return nil, err
 		}
 		return []plannedPack{{id: bp.id, path: bp.path, size: bp.size, applied: true}}, nil
 	}
 	// Over the limit and splittable: discard the single pack and bin-pack.
-	_ = os.Remove(bp.path)
-	return e.splitEncryptPacks(stdin, wants, budget)
+	if err := os.Remove(bp.path); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("remove superseded single push pack %q: %w", bp.path, err)
+	}
+	return e.splitEncryptPacks(stdin, wants, budget, e.Key, "push")
 }
 
 // buildSinglePack streams `git pack-objects --revs --stdout` for the given revs
-// stdin through the encryptor into a temp file, sniffing the pack header for the
-// object count so empty packs are dropped. It does NOT enforce the size limit;
-// the caller decides whether the pack fits or must be split.
-func (e *Engine) buildSinglePack(stdin string) (builtPack, error) {
-	pw, err := agecrypt.NewPackWriter(e.St.TmpDir(), e.Key)
+// stdin through the encryptor under key into a temp file, sniffing the pack
+// header for the object count. When a limit is configured, ciphertext output
+// stops at that bound and overLimit tells the caller to split without first
+// materializing the whole oversized pack. operation labels errors.
+func (e *Engine) buildSinglePack(stdin string, key keystore.Key, operation string) (builtPack, error) {
+	pw, err := agecrypt.NewPackWriterLimited(e.St.TmpDir(), key, e.Cfg.MaxPackBytes)
 	if err != nil {
+		if errors.Is(err, agecrypt.ErrCiphertextLimit) {
+			return builtPack{size: e.Cfg.MaxPackBytes + 1, overLimit: true}, nil
+		}
 		return builtPack{}, err
 	}
 	sniff := &packHeadSniffer{dst: pw}
@@ -522,8 +686,11 @@ func (e *Engine) buildSinglePack(stdin string) (builtPack, error) {
 	if err := e.streamPack(pw, gitx.Opts{GitDir: e.LocalGitDir,
 		Stdin:  strings.NewReader(stdin),
 		Stdout: sniff},
-		"pack objects", "finalize pack",
+		"pack objects for "+operation, "finalize "+operation+" pack",
 		"--revs", "--stdout", "--delta-base-offset"); err != nil {
+		if pw.LimitExceeded() || errors.Is(err, agecrypt.ErrCiphertextLimit) {
+			return builtPack{size: e.Cfg.MaxPackBytes + 1, count: sniff.count(), overLimit: true}, nil
+		}
 		return builtPack{}, err
 	}
 	e.Log.Info("built pack", "objects", sniff.count(), "ciphertext_bytes", pw.Size())
@@ -532,22 +699,32 @@ func (e *Engine) buildSinglePack(stdin string) (builtPack, error) {
 
 // splitEncryptPacks re-packs the same revs stdin into multiple sub-limit packs
 // with git's --max-pack-size (which, unlike --stdout, must write to files), then
-// encrypts each plaintext pack into its own ciphertext temp file. git produces
+// encrypts each plaintext pack under key into its own ciphertext temp file. git produces
 // complete, self-contained packs when splitting (no cross-pack thin deltas), so
 // fetch can index-pack each independently. A produced pack that still exceeds
 // the limit holds a single object larger than the limit -- which no split can
 // fix -- and yields a TooLarge error naming the offending file. The scratch
 // plaintext packs live under TmpDir() (the local repo is plaintext anyway) and
 // are removed on return; ciphertext temp files are cleaned up on any error.
-func (e *Engine) splitEncryptPacks(stdin string, wants []string, budget int64) ([]plannedPack, error) {
+func (e *Engine) splitEncryptPacks(stdin string, wants []string, budget int64, key keystore.Key, operation string) (result []plannedPack, retErr error) {
 	scratch, err := os.MkdirTemp(e.St.TmpDir(), "split-")
 	if err != nil {
 		return nil, fmt.Errorf("create pack-split scratch dir: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(scratch) }()
+	defer func() {
+		if err := os.RemoveAll(scratch); err != nil {
+			if retErr == nil {
+				for _, p := range result {
+					joinScratchRemoval(p.path, "encrypted split pack", &retErr)
+				}
+				result = nil
+			}
+			retErr = errors.Join(retErr, fmt.Errorf("remove pack-split scratch directory %q: %w", scratch, err))
+		}
+	}()
 
 	base := filepath.Join(scratch, "pack")
-	e.phase("splitting oversized push")
+	e.phase("splitting oversized %s", operation)
 	if _, _, err := e.G.Run(gitx.Opts{GitDir: e.LocalGitDir, Stdin: strings.NewReader(stdin)},
 		"pack-objects", "--revs", "--delta-base-offset",
 		"--max-pack-size", strconv.FormatInt(budget, 10), base); err != nil {
@@ -560,51 +737,72 @@ func (e *Engine) splitEncryptPacks(stdin string, wants []string, budget int64) (
 	sort.Strings(plainPacks)
 
 	var packs []plannedPack
-	cleanup := func() {
+	cleanup := func() error {
+		var cleanupErr error
 		for _, p := range packs {
-			_ = os.Remove(p.path)
+			joinScratchRemoval(p.path, "encrypted split pack", &cleanupErr)
 		}
+		return cleanupErr
 	}
 	for i, pf := range plainPacks {
 		e.phase("encrypting pack %d/%d", i+1, len(plainPacks))
-		pp, err := e.encryptPackFile(pf)
+		pp, err := e.encryptPackFile(pf, key)
 		if err != nil {
-			cleanup()
-			return nil, err
+			cleanupErr := cleanup()
+			if errors.Is(err, agecrypt.ErrCiphertextLimit) {
+				return nil, errors.Join(packFileTooLargeErr(operation, pp.size, e.Cfg.MaxPackBytes, e.offendingFile(pf, wants)), cleanupErr)
+			}
+			return nil, errors.Join(err, cleanupErr)
 		}
 		if e.Cfg.MaxPackBytes > 0 && pp.size > e.Cfg.MaxPackBytes {
-			_ = os.Remove(pp.path)
-			cleanup()
-			return nil, pushFileTooLargeErr(pp.size, e.Cfg.MaxPackBytes, e.offendingFile(pf, wants))
+			var cleanupErr error
+			joinScratchRemoval(pp.path, "over-limit encrypted split pack", &cleanupErr)
+			cleanupErr = errors.Join(cleanupErr, cleanup())
+			return nil, errors.Join(packFileTooLargeErr(operation, pp.size, e.Cfg.MaxPackBytes, e.offendingFile(pf, wants)), cleanupErr)
 		}
 		packs = append(packs, pp)
 	}
 	if len(packs) == 0 {
 		return nil, nil
 	}
-	e.Log.Info("split oversized push into packs", "packs", len(packs))
+	e.Log.Info("split oversized operation into packs", "operation", operation, "packs", len(packs))
 	return packs, nil
 }
 
 // encryptPackFile encrypts the plaintext pack at plainPath (one of the split
-// outputs) into a fresh ciphertext temp file, returning its planned-pack
-// identity. The objects were read from the local repo, so applied is true.
-func (e *Engine) encryptPackFile(plainPath string) (plannedPack, error) {
+// outputs) under key into a fresh ciphertext temp file, returning its
+// planned-pack identity. The objects were read from the local repo, so applied
+// is true.
+func (e *Engine) encryptPackFile(plainPath string, key keystore.Key) (result plannedPack, retErr error) {
 	in, err := os.Open(plainPath) // #nosec G304 -- plainPath is a TmpDir scratch pack git just wrote; no untrusted component
 	if err != nil {
 		return plannedPack{}, fmt.Errorf("open split pack %q: %w", plainPath, err)
 	}
-	defer func() { _ = in.Close() }()
-	pw, err := agecrypt.NewPackWriter(e.St.TmpDir(), e.Key)
+	defer func() {
+		if err := in.Close(); err != nil {
+			if result.path != "" {
+				joinScratchRemoval(result.path, "encrypted split pack", &retErr)
+				result = plannedPack{}
+			}
+			retErr = errors.Join(retErr, fmt.Errorf("close plaintext split pack %q: %w", plainPath, err))
+		}
+	}()
+	pw, err := agecrypt.NewPackWriterLimited(e.St.TmpDir(), key, e.Cfg.MaxPackBytes)
 	if err != nil {
 		return plannedPack{}, err
 	}
 	if _, err := io.Copy(pw, in); err != nil {
 		pw.Abort()
+		if pw.LimitExceeded() || errors.Is(err, agecrypt.ErrCiphertextLimit) {
+			return plannedPack{size: e.Cfg.MaxPackBytes + 1}, agecrypt.ErrCiphertextLimit
+		}
 		return plannedPack{}, cloakerr.New(cloakerr.Crypto, "encrypt split pack", err)
 	}
 	if err := pw.Close(); err != nil {
 		pw.Abort()
+		if pw.LimitExceeded() || errors.Is(err, agecrypt.ErrCiphertextLimit) {
+			return plannedPack{size: e.Cfg.MaxPackBytes + 1}, agecrypt.ErrCiphertextLimit
+		}
 		return plannedPack{}, cloakerr.New(cloakerr.Crypto, "finalize split pack", err)
 	}
 	return plannedPack{id: pw.ID(), path: pw.Path(), size: pw.Size(), applied: true}, nil
@@ -728,20 +926,43 @@ func (e *Engine) buildBackendCommit(in commitInput) (builtCommit, error) {
 // ciphertext into a backend blob. Returns the manifest blob oid and the
 // ciphertext hash (the rollback pin value).
 func (e *Engine) encryptManifestBlob(man *manifest.Manifest, key keystore.Key) (manifestOID, manifestHash string, err error) {
-	plain, err := manifest.Encode(man)
+	ct, manifestHash, err := EncryptManifest(man, key)
 	if err != nil {
 		return "", "", err
 	}
-	ct, err := agecrypt.EncryptBytes(key, plain)
-	if err != nil {
-		return "", "", err
-	}
-	manifestHash = ciphertextHash(ct)
 	manifestOID, err = e.Be.HashObject(bytes.NewReader(ct))
 	if err != nil {
 		return "", "", err
 	}
 	return manifestOID, manifestHash, nil
+}
+
+// EncryptManifest validates, encodes, and encrypts a manifest while enforcing
+// the exact ciphertext cap used by backend.ReadBlobBytes. The debug seeder and
+// normal push path share this function so neither can publish a generation
+// that ordinary clients cannot read.
+func EncryptManifest(man *manifest.Manifest, key keystore.Key) (ciphertext []byte, hash string, err error) {
+	plain, err := manifest.Encode(man)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(plain) > backend.MaxManifestBytes {
+		return nil, "", cloakerr.Newf(cloakerr.TooLarge, "encode manifest",
+			"manifest is %d bytes, exceeding the readable limit of %d", len(plain), backend.MaxManifestBytes)
+	}
+	ct, err := agecrypt.EncryptBytes(key, plain)
+	if err != nil {
+		return nil, "", err
+	}
+	// ReadBlobBytes caps the encrypted blob, not its plaintext. age adds a
+	// header and per-chunk authentication tags, so a plaintext just below the
+	// cap can still produce a ciphertext that no client can read. Enforce the
+	// actual stored size before constructing an unusable remote generation.
+	if len(ct) > backend.MaxManifestBytes {
+		return nil, "", cloakerr.Newf(cloakerr.TooLarge, "encrypt manifest",
+			"manifest ciphertext is %d bytes, exceeding the readable limit of %d", len(ct), backend.MaxManifestBytes)
+	}
+	return ct, ciphertextHash(ct), nil
 }
 
 // treePackBlobs assembles the pack id -> blob oid map for the new commit's
@@ -758,8 +979,12 @@ func (e *Engine) treePackBlobs(in commitInput) (map[string]string, error) {
 	// untrusted. Verify each still hashes to its pack id before carrying it into
 	// a freshly signed commit, so a host-corrupted blob cannot be laundered into
 	// a new generation that every client then fails to fetch (CR-001).
+	livePacks := make(map[string]manifest.Pack, len(in.man.Packs))
+	for _, p := range in.man.Packs {
+		livePacks[p.ID] = p
+	}
 	for id := range packOIDs {
-		if err := e.verifyReusedPackBlob(in.blobSource, id); err != nil {
+		if err := e.verifyReusedPackBlob(in.blobSource, livePacks[id]); err != nil {
 			return nil, err
 		}
 	}

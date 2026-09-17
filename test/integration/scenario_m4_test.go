@@ -99,7 +99,7 @@ func TestScenario7RepackRekey(t *testing.T) {
 
 	k2 := filepath.Join(t.TempDir(), "k2")
 	a.MustCloak("keygen", "--key", "file:"+k2)
-	out := a.MustCloak("rekey", "--remote", "origin", "--new-key", "file:"+k2)
+	out := a.MustCloak("rekey", "--remote", "origin", "--new-key", "file:"+k2, "--force-insecure")
 	if !strings.Contains(out, "Rekeyed") {
 		t.Fatalf("rekey output: %q", out)
 	}

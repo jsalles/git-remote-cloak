@@ -6,12 +6,12 @@
 package setup
 
 import (
-	"fmt"
+	"bytes"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/b4ryon/git-remote-cloak/internal/backend"
@@ -22,14 +22,8 @@ import (
 	"github.com/b4ryon/git-remote-cloak/internal/keystore"
 	"github.com/b4ryon/git-remote-cloak/internal/logx"
 	"github.com/b4ryon/git-remote-cloak/internal/state"
+	"github.com/b4ryon/git-remote-cloak/internal/urlredact"
 )
-
-// helperURLRe matches git's remote-helper transport syntax (<word>::...),
-// e.g. "ext::", "fd::", or a nested "cloak::". After stripping the cloak::
-// prefix the backend URL must be a real transport (https/ssh/git/file,
-// scp-like SSH, or a local path) and never another helper, so a malicious
-// "cloak::ext::sh -c ..." cannot reach git's arbitrary-command transports.
-var helperURLRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9+.-]*::`)
 
 // Session is a fully wired engine plus validated remote state. Close
 // releases the state lock and the log file.
@@ -77,9 +71,22 @@ func (s *Session) LoadRemote() error {
 	return nil
 }
 
+// LoadRemoteUnchecked refreshes s.RS without applying local rollback or
+// repository-identity pins. It exists only for explicit accept-* recovery,
+// which verifies all referenced storage before replacing the old anchors.
+func (s *Session) LoadRemoteUnchecked() error {
+	rs, err := s.Eng.LoadRemoteStateUnchecked()
+	if err != nil {
+		return err
+	}
+	s.RS = rs
+	return nil
+}
+
 // OpenLocal wires everything local (paths, config, key, state lock,
-// logging, backend mirror, engine) WITHOUT touching the remote. Used by
-// accept-rollback, which must clear the pin before any validation runs.
+// logging, backend mirror, engine) WITHOUT touching the remote. Explicit
+// accept-* recovery uses it to retain the old trust anchors while loading and
+// verifying a candidate through LoadRemoteUnchecked.
 func OpenLocal(remoteName, url string, stderr io.Writer, role string) (*Session, error) {
 	boot, _ := logx.Setup(logx.Options{Stderr: stderr, StderrLevel: slog.LevelWarn, Role: role})
 	g := gitx.New(boot)
@@ -101,15 +108,7 @@ func OpenLocal(remoteName, url string, stderr io.Writer, role string) (*Session,
 	}
 	stateName, selector := stateIdentity(g, localGitDir, remoteName, url, explicitURL)
 
-	key, err := keystore.Load(cfg.KeyRef)
-	if err != nil {
-		// Name the actual ref in play so the file backend (and a misconfigured
-		// keyRef on any platform) gives a recovery path, not a bare OS error.
-		return nil, cloakerr.WithHintOn(err, fmt.Sprintf(
-			"cloak.keyRef is %q for this repo; verify it points at your key, then run `git cloak keygen` (first machine) or `git cloak key import` (a new machine)", cfg.KeyRef))
-	}
-
-	return wireSession(g, cfg, key, sessionPaths{
+	return wireSession(g, cfg, sessionPaths{
 		localGitDir: localGitDir, common: common, url: url,
 		remoteName: remoteName, stateName: stateName, selector: selector,
 	}, stderr, role)
@@ -129,11 +128,11 @@ func OpenLocal(remoteName, url string, stderr io.Writer, role string) (*Session,
 func stateIdentity(g *gitx.G, localGitDir, remoteName, url string, explicitURL bool) (stateName, selector string) {
 	if !explicitURL || matchesFetchURL(g, localGitDir, remoteName, url) {
 		if remoteName != "origin" {
-			return remoteName, "--remote " + remoteName
+			return remoteName, "--remote " + urlredact.ShellArg(urlredact.URL(remoteName))
 		}
 		return remoteName, ""
 	}
-	return "", "--url cloak::" + url
+	return "", "--url " + urlredact.ShellArg(urlredact.URL("cloak::"+url))
 }
 
 // matchesFetchURL reports whether url (already cloak::-stripped) is
@@ -149,18 +148,23 @@ func matchesFetchURL(g *gitx.G, localGitDir, remoteName, url string) bool {
 	if remoteName == "" {
 		return false
 	}
-	raw, err := g.Out(gitx.Opts{GitDir: localGitDir}, "config", "--get-all", "remote."+remoteName+".url")
+	raw, err := g.Out(gitx.Opts{GitDir: localGitDir, SensitiveArgs: true, SensitiveURLs: []string{remoteName}},
+		"config", "--get-all", "remote."+remoteName+".url")
 	if err != nil || raw == "" {
 		return false
 	}
 	if i := strings.IndexByte(raw, '\n'); i >= 0 {
 		raw = raw[:i]
 	}
-	if strings.TrimPrefix(raw, "cloak::") == url {
-		return true
+	resolved, err := g.Out(gitx.Opts{GitDir: localGitDir, SensitiveArgs: true, SensitiveURLs: []string{raw}},
+		"ls-remote", "--get-url", "--", remoteName)
+	if err != nil {
+		return false
 	}
-	resolved, err := g.Out(gitx.Opts{GitDir: localGitDir}, "ls-remote", "--get-url", remoteName)
-	return err == nil && strings.TrimPrefix(resolved, "cloak::") == url
+	inner := strings.TrimPrefix(resolved, "cloak::")
+	innerResolved, err := g.Out(gitx.Opts{GitDir: localGitDir, SensitiveArgs: true, SensitiveURLs: []string{inner}},
+		"ls-remote", "--get-url", "--", inner)
+	return err == nil && innerResolved == url
 }
 
 // resolveGitDirs resolves the local git directory (honoring GIT_DIR) and the
@@ -180,38 +184,177 @@ func resolveGitDirs(g *gitx.G) (localGitDir, common string, err error) {
 	}
 	common = filepath.Clean(common)
 
-	if format, err := g.Out(gitx.Opts{GitDir: localGitDir}, "rev-parse", "--show-object-format"); err == nil && format != "sha1" {
+	format, err := g.Out(gitx.Opts{GitDir: localGitDir}, "rev-parse", "--show-object-format")
+	if err != nil {
+		return "", "", cloakerr.New(cloakerr.LocalGit, "inspect object format", err)
+	}
+	if format != "sha1" {
 		return "", "", cloakerr.Newf(cloakerr.LocalGit, "object format",
 			"%s repositories are not supported in v0 (sha1 only)", format)
 	}
+	shallow, err := g.Out(gitx.Opts{GitDir: localGitDir}, "rev-parse", "--is-shallow-repository")
+	if err != nil {
+		return "", "", cloakerr.New(cloakerr.LocalGit, "inspect shallow repository state", err)
+	}
+	if shallow == "true" {
+		return "", "", cloakerr.Newf(cloakerr.LocalGit, "repository topology",
+			"shallow repositories are not supported because omitted history would weaken object-closure verification")
+	}
+	replacements, err := g.Out(gitx.Opts{GitDir: localGitDir}, "replace", "-l")
+	if err != nil {
+		return "", "", cloakerr.New(cloakerr.LocalGit, "inspect replacement objects", err)
+	}
+	if replacements != "" {
+		return "", "", cloakerr.Newf(cloakerr.LocalGit, "repository topology",
+			"git replace objects are not supported because they alter authenticated history traversal")
+	}
+	graftsPath, err := g.Out(gitx.Opts{GitDir: localGitDir}, "rev-parse", "--path-format=absolute", "--git-path", "info/grafts")
+	if err != nil {
+		return "", "", cloakerr.New(cloakerr.LocalGit, "inspect grafts path", err)
+	}
+	if fi, statErr := os.Stat(graftsPath); statErr == nil && fi.Size() > 0 {
+		return "", "", cloakerr.Newf(cloakerr.LocalGit, "repository topology",
+			"git grafts are not supported because they alter authenticated history traversal")
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return "", "", cloakerr.New(cloakerr.LocalGit, "inspect grafts file", statErr)
+	}
+	if path, err := lfsTrackedPath(g, localGitDir); err != nil {
+		return "", "", err
+	} else if path != "" {
+		return "", "", cloakerr.Newfh(cloakerr.LocalGit, "repository attributes",
+			"remove Git LFS attributes and objects before using cloak; the LFS transport bypasses cloak encryption",
+			"tracked path %q uses filter=lfs", path)
+	}
+	hookPath, err := g.Out(gitx.Opts{GitDir: localGitDir}, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push")
+	if err != nil {
+		return "", "", cloakerr.New(cloakerr.LocalGit, "inspect pre-push hook path", err)
+	}
+	if usesLFS, err := lfsPrePushHook(hookPath); err != nil {
+		return "", "", err
+	} else if usesLFS {
+		return "", "", cloakerr.Newfh(cloakerr.LocalGit, "repository hooks",
+			"remove the Git LFS pre-push hook before using cloak; LFS uploads use a separate plaintext transport",
+			"pre-push hook at %q invokes Git LFS", hookPath)
+	}
 	return localGitDir, common, nil
+}
+
+func lfsPrePushHook(path string) (bool, error) {
+	fi, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, cloakerr.New(cloakerr.LocalGit, "inspect pre-push hook", err)
+	}
+	if !fi.Mode().IsRegular() || fi.Mode().Perm()&0o111 == 0 {
+		return false, nil // Git will not execute it as a hook.
+	}
+	const maxHookInspectionBytes = 1 << 20
+	if fi.Size() > maxHookInspectionBytes {
+		return false, cloakerr.Newfh(cloakerr.LocalGit, "inspect pre-push hook",
+			"reduce or remove the hook, or verify manually that it cannot invoke a plaintext side transport such as Git LFS",
+			"executable pre-push hook %q exceeds the %d-byte inspection limit", path, maxHookInspectionBytes)
+	}
+	f, err := os.Open(path) // #nosec G304 -- path comes from git rev-parse --git-path for the current repository
+	if err != nil {
+		return false, cloakerr.New(cloakerr.LocalGit, "inspect pre-push hook", err)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(f, maxHookInspectionBytes+1))
+	closeErr := f.Close()
+	if readErr != nil || closeErr != nil {
+		return false, cloakerr.New(cloakerr.LocalGit, "read pre-push hook", errors.Join(readErr, closeErr))
+	}
+	if len(data) > maxHookInspectionBytes {
+		return false, cloakerr.Newfh(cloakerr.LocalGit, "inspect pre-push hook",
+			"reduce or remove the hook, or verify manually that it cannot invoke a plaintext side transport such as Git LFS",
+			"executable pre-push hook %q changed beyond the %d-byte inspection limit", path, maxHookInspectionBytes)
+	}
+	lower := bytes.ToLower(data)
+	return bytes.Contains(lower, []byte("git lfs pre-push")) ||
+		bytes.Contains(lower, []byte("git-lfs pre-push")), nil
+}
+
+// lfsTrackedPath returns one indexed path whose effective Git attributes select
+// the LFS filter. It asks Git to resolve repository, info, and global attribute
+// rules exactly as a push hook would; NUL framing preserves unusual filenames.
+func lfsTrackedPath(g *gitx.G, gitDir string) (string, error) {
+	paths, _, err := g.Run(gitx.Opts{GitDir: gitDir}, "ls-files", "-z")
+	if err != nil {
+		return "", cloakerr.New(cloakerr.LocalGit, "enumerate tracked files for LFS", err)
+	}
+	if paths == "" {
+		return "", nil
+	}
+	attrs, _, err := g.Run(gitx.Opts{GitDir: gitDir, Stdin: strings.NewReader(paths)},
+		"check-attr", "--cached", "-z", "--stdin", "filter")
+	if err != nil {
+		return "", cloakerr.New(cloakerr.LocalGit, "inspect Git LFS attributes", err)
+	}
+	fields := bytes.Split([]byte(attrs), []byte{0})
+	for i := 0; i+2 < len(fields); i += 3 {
+		if string(fields[i+1]) == "filter" && string(fields[i+2]) == "lfs" {
+			return string(fields[i]), nil
+		}
+	}
+	return "", nil
 }
 
 // resolveBackendURL resolves and validates the backend transport URL. When url
 // is empty it is read from remote.<remoteName>.url (which must be a cloak::
 // remote); the cloak:: prefix is then stripped and the result is rejected if
-// empty or itself a remote-helper transport (ext::/fd::/nested helpers).
+// empty or any external remote-helper transport (explicit ext::/fd::/nested
+// syntax or an unknown scheme:// URL).
 func resolveBackendURL(g *gitx.G, localGitDir, remoteName, url string) (string, error) {
 	if url == "" {
-		raw, err := g.Out(gitx.Opts{GitDir: localGitDir}, "config", "--get", "remote."+remoteName+".url")
+		raw, err := g.Out(gitx.Opts{GitDir: localGitDir, SensitiveArgs: true, SensitiveURLs: []string{remoteName}},
+			"config", "--get", "remote."+remoteName+".url")
 		if err != nil {
 			return "", cloakerr.Newf(cloakerr.LocalGit, "resolve remote",
-				"remote %q has no configured URL", remoteName)
+				"remote %q has no configured URL", urlredact.URL(remoteName))
 		}
 		if !strings.HasPrefix(raw, "cloak::") {
 			return "", cloakerr.Newf(cloakerr.LocalGit, "resolve remote",
-				"remote %q is not a cloak:: remote (url %q)", remoteName, raw)
+				"remote %q is not a cloak:: remote (url %q)", urlredact.URL(remoteName), urlredact.URL(raw))
 		}
-		url = raw
+		// Resolve url.*.insteadOf exactly as Git does before invoking a helper.
+		// --get-url performs no network access.
+		resolved, err := g.Out(gitx.Opts{GitDir: localGitDir, SensitiveArgs: true, SensitiveURLs: []string{raw}},
+			"ls-remote", "--get-url", "--", remoteName)
+		if err != nil {
+			return "", cloakerr.New(cloakerr.LocalGit, "resolve rewritten remote URL", err)
+		}
+		url = resolved
 	}
 	url = strings.TrimPrefix(url, "cloak::")
 	if url == "" {
 		return "", cloakerr.Newf(cloakerr.LocalGit, "resolve remote",
 			"empty backend URL after the cloak:: prefix")
 	}
-	if helperURLRe.MatchString(url) {
+	// The underlying transport is itself subject to url.*.insteadOf when the
+	// private backend mirror invokes Git. Resolve and validate that effective URL
+	// too, otherwise a harmless-looking alias could expand to embedded secrets.
+	if g != nil {
+		resolved, err := g.Out(gitx.Opts{GitDir: localGitDir, SensitiveArgs: true, SensitiveURLs: []string{url}},
+			"ls-remote", "--get-url", "--", url)
+		if err != nil {
+			return "", cloakerr.New(cloakerr.LocalGit, "resolve effective backend URL", err)
+		}
+		url = resolved
+	}
+	if risk := urlredact.CredentialRisk(url); risk != "" {
+		return "", cloakerr.Newfh(cloakerr.LocalGit, "validate remote credentials",
+			"use an SSH URL or Git credential helper; do not place credentials, query tokens, or fragments in a cloak backend URL",
+			"refusing %s in backend URL %q", risk, urlredact.URL(url))
+	}
+	if urlredact.IsHelperTransport(url) {
 		return "", cloakerr.Newf(cloakerr.LocalGit, "validate remote transport",
-			"refusing remote-helper transport in backend URL %q (cloak does not allow ext::/fd:: or nested helpers)", url)
+			"refusing remote-helper transport in backend URL (cloak does not allow ext::/fd:: or nested helpers)")
+	}
+	if !urlredact.IsSupportedTransport(url) {
+		return "", cloakerr.Newfh(cloakerr.LocalGit, "validate remote transport",
+			"use a local path, scp-like SSH location, or a file, git, http, https, ssh, or git+ssh URL",
+			"refusing unsupported URL scheme because Git would execute an external remote helper")
 	}
 	return url, nil
 }
@@ -230,7 +373,7 @@ type sessionPaths struct {
 // wireSession opens the per-remote state dir and lock, sets up per-repo file
 // logging, opens the backend mirror, and assembles the Engine. The returned
 // Session owns the lock and log-file closers.
-func wireSession(g *gitx.G, cfg config.Config, key keystore.Key, p sessionPaths, stderr io.Writer, role string) (*Session, error) {
+func wireSession(g *gitx.G, cfg config.Config, p sessionPaths, stderr io.Writer, role string) (*Session, error) {
 	st, err := state.Open(p.common, p.stateName, p.url)
 	if err != nil {
 		return nil, cloakerr.New(cloakerr.LocalGit, "open state dir", err)
@@ -239,6 +382,18 @@ func wireSession(g *gitx.G, cfg config.Config, key keystore.Key, p sessionPaths,
 	unlock, err := st.Lock()
 	if err != nil {
 		return nil, cloakerr.New(cloakerr.LocalGit, "lock state dir", err)
+	}
+	if err := st.CleanTmp(); err != nil {
+		unlockErr := unlock()
+		return nil, cloakerr.New(cloakerr.LocalGit, "clean stale scratch data", errors.Join(err, unlockErr))
+	}
+	key, err := keystore.Load(cfg.KeyRef)
+	if err != nil {
+		// Clean stale plaintext before attempting the key load. Name the actual
+		// ref so a missing/misconfigured backend still has an actionable path.
+		keyErr := cloakerr.WithHintOn(err,
+			"the configured cloak.keyRef could not be loaded; verify it points at a key reference (never paste exported key material into Git config), then run `git cloak keygen` on the first machine or `git cloak key import` on a new machine")
+		return nil, errors.Join(keyErr, unlock())
 	}
 	s := &Session{G: g, Cfg: cfg, St: st}
 	// Release the lock (logging a failed unlock/close instead of dropping it)
@@ -260,10 +415,10 @@ func wireSession(g *gitx.G, cfg config.Config, key keystore.Key, p sessionPaths,
 		FileLevel:   logx.FileLevel(cfg.LogLevel),
 		Role:        role,
 	})
-	s.Log = lg.With("remote", p.remoteName)
+	s.Log = lg.With("remote", urlredact.URL(p.remoteName))
 	s.closers = append(s.closers, closeLog)
 	g.SetLogger(s.Log)
-	s.Log.Info("session start", "url", p.url, "keyid", key.ID(), "branch", cfg.Branch)
+	s.Log.Info("session start", "url", urlredact.URL(p.url), "keyid", key.ID(), "branch", cfg.Branch)
 
 	be, err := backend.Open(g, st.BackendGitDir(), p.url, cfg.Branch, s.Log)
 	if err != nil {

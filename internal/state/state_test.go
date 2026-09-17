@@ -149,6 +149,20 @@ func TestAlarmMessagesEmbedSelector(t *testing.T) {
 		t.Fatalf("repo-id alarm missing the selector: %v", err)
 	}
 
+	d.Selector = "--url cloak::https://alice-sentinel:password-sentinel@host/repo?token=token-sentinel#fragment-sentinel"
+	if err := d.CheckPin(nil, ""); err == nil {
+		t.Fatal("credential-bearing selector did not produce a rollback alarm")
+	} else {
+		for _, secret := range []string{"alice-sentinel", "password-sentinel", "token-sentinel", "fragment-sentinel"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("rollback alarm leaked selector credential %q: %v", secret, err)
+			}
+		}
+		if !strings.Contains(err.Error(), "--url cloak::https://host/repo") {
+			t.Fatalf("rollback alarm lost useful redacted selector: %v", err)
+		}
+	}
+
 	// Inconsistent local state (pin without repo-id pin) names the real dir.
 	if err := d.ClearRepoID(); err != nil {
 		t.Fatal(err)
@@ -318,6 +332,31 @@ func TestWriteStateFileFailureLeavesPriorStateIntact(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("a failed write damaged the prior pin: got %+v, want %+v", got, want)
+	}
+}
+
+func TestCleanTmpRemovesInterruptedScratch(t *testing.T) {
+	d := openDir(t)
+	plain := filepath.Join(d.TmpDir(), "pack-deadbeef.pack")
+	nested := filepath.Join(d.TmpDir(), "split-stale", "objects")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plain, []byte("plaintext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "object"), []byte("plaintext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CleanTmp(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(d.TmpDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("scratch directory still contains %v", entries)
 	}
 }
 

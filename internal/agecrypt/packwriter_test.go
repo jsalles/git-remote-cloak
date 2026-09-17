@@ -75,6 +75,47 @@ func TestPackWriterAbortRemovesFile(t *testing.T) {
 	}
 }
 
+func TestPackWriterCiphertextLimit(t *testing.T) {
+	const limit = int64(1024)
+	dir := t.TempDir()
+	pw, err := NewPackWriterLimited(dir, testKey(t), limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext := make([]byte, 128<<10)
+	if _, err := rand.Read(plaintext); err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := pw.Write(plaintext)
+	closeErr := pw.Close()
+	if !pw.LimitExceeded() {
+		t.Fatalf("writer did not report exceeding %d bytes (write=%v close=%v)", limit, writeErr, closeErr)
+	}
+	if !errors.Is(writeErr, ErrCiphertextLimit) && !errors.Is(closeErr, ErrCiphertextLimit) {
+		t.Fatalf("limit sentinel missing (write=%v close=%v)", writeErr, closeErr)
+	}
+	if info, err := os.Stat(pw.Path()); err != nil {
+		t.Fatal(err)
+	} else if info.Size() > limit {
+		t.Fatalf("limited ciphertext grew to %d bytes, limit %d", info.Size(), limit)
+	}
+	pw.Abort()
+}
+
+func TestPackWriterLimitCanRejectHeader(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := NewPackWriterLimited(dir, testKey(t), 1); !errors.Is(err, ErrCiphertextLimit) {
+		t.Fatalf("one-byte limit error = %v, want ErrCiphertextLimit", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed limited writer left scratch files: %v", entries)
+	}
+}
+
 // TestNewPackWriterCreateTempErrorCarriesContext proves the pack encryptor's
 // scratch-file creation failure carries operation context (clause-2 wrapping),
 // not just a bare OS path. A missing scratch dir makes os.CreateTemp fail

@@ -31,7 +31,7 @@
 // generalizes it over arbitrary, adversarial branch/commit/lease.
 // backendRefRejected is the write-side completion of that surface: it decides
 // whether git's --porcelain push stdout shows our backend branch's ref update
-// was refused (a lost compare-and-swap to re-fetch and retry) -- the push-path
+// was refused (which triggers an exact-head probe) -- the push-path
 // sibling of the read-path classifiers classifyBlobRead and classifyFetchErr.
 // Its load-bearing security contract is that only git's LOCAL "!" rejection flag
 // for our branch counts: host-relayed text (the "remote:" sideband, the
@@ -60,7 +60,7 @@ import (
 // limit. The oracle recomputes the expected kept prefix independently from the
 // concatenated input, so it cannot merely restate the implementation. The limit
 // is fuzzed as a uint32 (non-negative by construction, matching the positive
-// maxManifestBytes constant the production caller always passes).
+// MaxManifestBytes constant the production caller always passes).
 func FuzzCappingWriter(f *testing.F) {
 	// Seeds: under limit, single straddling write, empty content, exact fit,
 	// zero limit (everything overflows), and a chunk size that splits the
@@ -457,11 +457,10 @@ func FuzzClassifyFetchErr(f *testing.F) {
 }
 
 // FuzzPushArgs pins pushArgs as cloak's compare-and-swap push-command builder.
-// The backend never blind-force-pushes: PushFF (lease=="") emits a plain
-// fast-forward whose CAS comes from git's own ref-changed-since-discovery
-// rejection, and PushLease (lease!="") emits a --force-with-lease carrying an
-// explicit expected old value, so a concurrent winner's commit is detected and
-// the push loses the race rather than clobbering it. A plain --force/-f would
+// The backend never blind-force-pushes: both normal and squashing updates emit
+// --force-with-lease carrying an explicit expected old value (empty means the
+// branch must not exist), so rewinds, deletions, and concurrent winners are
+// detected rather than overwritten. A plain --force/-f would
 // defeat that and silently overwrite another client's accepted state, so it must
 // be impossible to produce for ANY input -- including adversarial branch/commit/
 // lease that smuggle in flag-shaped or delimiter-shaped substrings ("--force",
@@ -506,16 +505,13 @@ func FuzzPushArgs(f *testing.F) {
 }
 
 // assertPushSkeleton pins pushArgs's command skeleton:
-// `push --porcelain [<lease>] origin <refspec>`. Exactly 4 args without a lease,
-// 5 with one -- no extra or dropped arg (a dropped --porcelain would break
+// `push --porcelain <lease> origin <refspec>`. Exactly 5 args -- no extra or
+// dropped arg (a dropped --porcelain would break
 // push()'s result parsing) -- with origin as the remote and the exact
 // <commit>:refs/heads/<branch> refspec.
 func assertPushSkeleton(t *testing.T, args []string, branch, commit, lease string) {
 	t.Helper()
-	wantLen := 4
-	if lease != "" {
-		wantLen = 5
-	}
+	wantLen := 5
 	if len(args) != wantLen {
 		t.Fatalf("len(args) = %d, want %d: %v", len(args), wantLen, args)
 	}
@@ -546,10 +542,9 @@ func assertNoBareForceFlag(t *testing.T, args []string) {
 	}
 }
 
-// assertLeaseForce pins that a force flag is present IFF a lease was requested,
-// and when present it is exactly the --force-with-lease form carrying
-// refs/heads/<branch> and the caller's explicit expected value <lease> -- never
-// a remembered or empty value that would weaken the compare-and-swap. Only the
+// assertLeaseForce pins that exactly one force-with-lease flag is always present
+// and carries refs/heads/<branch> plus the caller's explicit expected value
+// <lease>; an empty value deliberately asserts nonexistence. Only the
 // flags region args[1:len-2] is scanned, so an adversarial refspec positional is
 // never read as a flag.
 func assertLeaseForce(t *testing.T, args []string, branch, lease string) {
@@ -563,8 +558,8 @@ func assertLeaseForce(t *testing.T, args []string, branch, lease string) {
 			}
 		}
 	}
-	if hasForce := forceFlags > 0; hasForce != (lease != "") {
-		t.Fatalf("force present = %v, want %v (lease=%q)", hasForce, lease != "", lease)
+	if forceFlags != 1 {
+		t.Fatalf("force-with-lease count = %d, want 1 (lease=%q)", forceFlags, lease)
 	}
 }
 
@@ -578,13 +573,13 @@ func assertLeaseForce(t *testing.T, args []string, branch, lease string) {
 // must always read as no rejection, so a host cannot forge one.
 func FuzzBackendRefRejected(f *testing.F) {
 	f.Add("To origin\n!\t9e90:refs/heads/cloak\t[remote rejected] (failed to update ref)\nDone", "cloak")
-	f.Add("To origin\n \t9e90:refs/heads/cloak\t04a1..4b5a\nDone", "cloak") // accepted, space flag
-	f.Add("!\tabc:refs/heads/other\t[rejected] (non-fast-forward)", "cloak") // unrelated ref
+	f.Add("To origin\n \t9e90:refs/heads/cloak\t04a1..4b5a\nDone", "cloak")        // accepted, space flag
+	f.Add("!\tabc:refs/heads/other\t[rejected] (non-fast-forward)", "cloak")       // unrelated ref
 	f.Add("remote: !\tx:refs/heads/cloak\t[rejected] (stale info)\nDone", "cloak") // forged sideband
 	f.Add("", "cloak")
-	f.Add("!\t:refs/heads/cloak\tx", "cloak")        // empty from-oid
-	f.Add("!\trefs/heads/cloak\tx", "cloak")         // malformed: no colon
-	f.Add("!\ta:refs/heads/a:b\tx", "a:b")           // colon in branch name
+	f.Add("!\t:refs/heads/cloak\tx", "cloak") // empty from-oid
+	f.Add("!\trefs/heads/cloak\tx", "cloak")  // malformed: no colon
+	f.Add("!\ta:refs/heads/a:b\tx", "a:b")    // colon in branch name
 
 	f.Fuzz(func(t *testing.T, stdout, branch string) {
 		got := backendRefRejected(stdout, branch)

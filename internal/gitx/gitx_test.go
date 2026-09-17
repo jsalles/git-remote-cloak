@@ -3,8 +3,11 @@
 package gitx
 
 import (
+	"bytes"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -35,6 +38,84 @@ func TestGitErrorCarriesStderrAndExit(t *testing.T) {
 	}
 	if ge.ExitCode == 0 || !strings.Contains(ge.Error(), "rev-parse") {
 		t.Fatalf("GitError = %+v", ge)
+	}
+}
+
+func TestRunRedactsSensitiveArgsAndURLDiagnostics(t *testing.T) {
+	const secretURL = "https://alice:password@example.invalid/repo.git?token=secret#private"
+	var logs bytes.Buffer
+	lg := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	g := New(lg)
+
+	_, stderr, err := g.Run(Opts{SensitiveArgs: true, SensitiveURLs: []string{secretURL}},
+		"hash-object", secretURL)
+	if err == nil {
+		t.Fatal("hash-object of a nonexistent URL-shaped path succeeded")
+	}
+	for name, output := range map[string]string{
+		"returned stderr": stderr,
+		"returned error":  err.Error(),
+		"debug log":       logs.String(),
+	} {
+		for _, secret := range []string{"alice", "password", "token=secret", "private"} {
+			if strings.Contains(output, secret) {
+				t.Errorf("%s leaked %q: %q", name, secret, output)
+			}
+		}
+	}
+	if !strings.Contains(err.Error(), "[redacted arguments]") {
+		t.Fatalf("returned error does not show argument redaction: %q", err)
+	}
+	if !strings.Contains(stderr, "https://example.invalid/repo.git") {
+		t.Fatalf("stderr lost useful redacted URL context: %q", stderr)
+	}
+}
+
+func TestApplyGitEnvCannotReenableCommandTransports(t *testing.T) {
+	got := applyGitEnv([]string{
+		"PATH=/bin",
+		"GIT_ALLOW_PROTOCOL=ssh:ext:fd:https",
+		"GIT_OBJECT_DIRECTORY=/source/objects",
+		"GIT_WORK_TREE=/source",
+	}, Opts{Env: []string{
+		"GIT_ALLOW_PROTOCOL=file:ext",
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES=/source/other",
+	}})
+	want := []string{
+		"PATH=/bin",
+		"GIT_ALLOW_PROTOCOL=" + allowedGitProtocols,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("environment = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("environment[%d] = %q, want %q (all %q)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestRunBlocksUnknownTransportDespiteInheritedWhitelist(t *testing.T) {
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "helper-ran")
+	helper := filepath.Join(dir, "git-remote-evil")
+	script := "#!/bin/sh\n: > \"$GITX_EVIL_SENTINEL\"\nexit 99\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GITX_EVIL_SENTINEL", sentinel)
+	t.Setenv("GIT_ALLOW_PROTOCOL", "evil:file:ssh:https")
+
+	_, stderr, err := runner().Run(Opts{}, "ls-remote", "evil://example.invalid/repo")
+	if err == nil {
+		t.Fatal("unknown external transport unexpectedly succeeded")
+	}
+	if _, statErr := os.Stat(sentinel); statErr == nil {
+		t.Fatalf("external transport helper executed: %s", sentinel)
+	}
+	if !strings.Contains(stderr, "transport 'evil' not allowed") {
+		t.Fatalf("Git did not report protocol-whitelist rejection: %q", stderr)
 	}
 }
 

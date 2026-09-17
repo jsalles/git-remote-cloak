@@ -21,6 +21,7 @@ import (
 
 	"github.com/b4ryon/git-remote-cloak/internal/cloakerr"
 	"github.com/b4ryon/git-remote-cloak/internal/gitx"
+	"github.com/b4ryon/git-remote-cloak/internal/urlredact"
 )
 
 // filterRejectedRe matches the git stderr a host emits when it refuses the
@@ -39,9 +40,12 @@ func stdinIsTTY() bool {
 // remoteHeadRef is where the fetched backend branch tip is stored locally.
 const remoteHeadRef = "refs/cloak/remote-head"
 
-// partialFilter keeps the manifest inline (small blob) while pack blobs
-// above the limit transfer lazily on first read.
-const partialFilter = "blob:limit=1m"
+// partialFilter keeps every blob out of the initial carrier fetch. Git's
+// promisor machinery fetches a requested blob into the private backend mirror
+// before ReadBlob can stream it through the engine's size/integrity checks, so
+// those checks bound later scratch/decrypt/apply work, not carrier traffic or
+// mirror disk use.
+const partialFilter = "blob:none"
 
 // Backend is an opened bare mirror bound to a host URL and branch.
 type Backend struct {
@@ -58,30 +62,127 @@ type Backend struct {
 // pack blobs download lazily; if the host rejects filtering, Fetch falls
 // back to full fetches and logs it.
 func Open(g *gitx.G, gitDir, url, branch string, log *slog.Logger) (*Backend, error) {
+	if err := validateRawURL(url); err != nil {
+		return nil, err
+	}
 	b := &Backend{g: g, gitDir: gitDir, url: url, branch: branch, log: log, partial: true}
-	if _, _, err := b.g.Run(gitx.Opts{}, "init", "--bare", "--initial-branch", branch, gitDir); err != nil {
+	if _, _, err := b.g.Run(gitx.Opts{Scrub: true}, "init", "--bare", "--object-format=sha1", "--initial-branch", branch, gitDir); err != nil {
 		return nil, cloakerr.New(cloakerr.LocalGit, "init backend mirror", err)
 	}
-	// blob:limit inlines small blobs (the manifest) while large pack blobs
-	// download lazily via the promisor machinery only when actually read,
-	// which is what lets consolidation lineage (Replaces) skip downloads.
+	format, err := b.g.Out(gitx.Opts{GitDir: gitDir}, "rev-parse", "--show-object-format")
+	if err != nil {
+		return nil, cloakerr.New(cloakerr.LocalGit, "inspect backend object format", err)
+	}
+	if format != "sha1" {
+		return nil, cloakerr.Newf(cloakerr.LocalGit, "inspect backend object format",
+			"backend mirror uses %s objects; cloak requires sha1", format)
+	}
+	// blob:none downloads blobs lazily via the promisor machinery only when
+	// actually read, which keeps pack transfer behind the engine's verification
+	// path and lets consolidation lineage (Replaces) skip downloads.
 	cfg := [][2]string{
 		{"remote.origin.url", url},
 		{"remote.origin.fetch", "+refs/heads/" + branch + ":" + remoteHeadRef},
 		{"remote.origin.tagopt", "--no-tags"},
 		{"remote.origin.promisor", "true"},
 		{"remote.origin.partialclonefilter", partialFilter},
+		{"gc.auto", "0"},
 	}
 	for _, kv := range cfg {
-		if _, _, err := b.g.Run(gitx.Opts{GitDir: gitDir}, "config", kv[0], kv[1]); err != nil {
+		opts := gitx.Opts{GitDir: gitDir}
+		if kv[0] == "remote.origin.url" {
+			opts.SensitiveArgs = true
+			opts.SensitiveURLs = []string{url}
+		}
+		if _, _, err := b.g.Run(opts, "config", kv[0], kv[1]); err != nil {
 			return nil, cloakerr.New(cloakerr.LocalGit, "configure backend mirror", err)
 		}
+	}
+	if err := b.validateEffectiveURLs(); err != nil {
+		return nil, err
+	}
+	if err := b.pruneUnreachable(); err != nil {
+		return nil, err
 	}
 	return b, nil
 }
 
-// URL returns the host URL this mirror is bound to.
-func (b *Backend) URL() string { return b.url }
+// validateRawURL rejects unsafe transport input before it is written to the
+// private mirror's config. setup normally performs the same validation, but
+// Backend is also used directly by the shipped debug seeder and by tests.
+func validateRawURL(raw string) error {
+	if raw == "" {
+		return cloakerr.Newf(cloakerr.LocalGit, "validate backend URL", "empty backend URL")
+	}
+	if risk := urlredact.CredentialRisk(raw); risk != "" {
+		return cloakerr.Newfh(cloakerr.LocalGit, "validate backend URL",
+			"use an SSH URL or Git credential helper; do not embed authentication material in backend URLs",
+			"refusing %s in backend URL %q", risk, urlredact.URL(raw))
+	}
+	if urlredact.IsHelperTransport(raw) || !urlredact.IsSupportedTransport(raw) {
+		return cloakerr.Newf(cloakerr.LocalGit, "validate backend URL",
+			"refusing external remote-helper transport")
+	}
+	return nil
+}
+
+// validateEffectiveURLs applies Git's fetch/push URL rewrite rules without
+// contacting the host. A pushInsteadOf rule must not silently route ciphertext
+// to a different carrier, and no rewrite may reintroduce credentials which the
+// setup layer already rejected.
+func (b *Backend) validateEffectiveURLs() error {
+	fetchURL, err := b.g.Out(gitx.Opts{GitDir: b.gitDir, SensitiveArgs: true, SensitiveURLs: []string{b.url}},
+		"remote", "get-url", "origin")
+	if err != nil {
+		return cloakerr.New(cloakerr.LocalGit, "resolve effective backend fetch URL", err)
+	}
+	pushOut, err := b.g.Out(gitx.Opts{GitDir: b.gitDir, SensitiveArgs: true, SensitiveURLs: []string{b.url}},
+		"remote", "get-url", "--push", "--all", "origin")
+	if err != nil {
+		return cloakerr.New(cloakerr.LocalGit, "resolve effective backend push URL", err)
+	}
+	if risk := urlredact.CredentialRisk(fetchURL); risk != "" {
+		return cloakerr.Newfh(cloakerr.LocalGit, "validate effective backend fetch URL",
+			"use an SSH URL or Git credential helper; do not embed authentication material in URL rewrites",
+			"refusing %s in backend URL %q", risk, urlredact.URL(fetchURL))
+	}
+	if urlredact.IsHelperTransport(fetchURL) {
+		return cloakerr.Newf(cloakerr.LocalGit, "validate effective backend fetch URL",
+			"refusing remote-helper transport after URL rewriting")
+	}
+	if !urlredact.IsSupportedTransport(fetchURL) {
+		return cloakerr.Newf(cloakerr.LocalGit, "validate effective backend fetch URL",
+			"refusing unsupported URL scheme after URL rewriting because Git would execute an external remote helper")
+	}
+	for _, pushURL := range strings.Split(strings.TrimSpace(pushOut), "\n") {
+		if pushURL == "" {
+			continue
+		}
+		if risk := urlredact.CredentialRisk(pushURL); risk != "" {
+			return cloakerr.Newfh(cloakerr.LocalGit, "validate effective backend push URL",
+				"use an SSH URL or Git credential helper; do not embed authentication material in URL rewrites",
+				"refusing %s in backend URL %q", risk, urlredact.URL(pushURL))
+		}
+		if urlredact.IsHelperTransport(pushURL) {
+			return cloakerr.Newf(cloakerr.LocalGit, "validate effective backend push URL",
+				"refusing remote-helper transport after URL rewriting")
+		}
+		if !urlredact.IsSupportedTransport(pushURL) {
+			return cloakerr.Newf(cloakerr.LocalGit, "validate effective backend push URL",
+				"refusing unsupported URL scheme after URL rewriting because Git would execute an external remote helper")
+		}
+		if pushURL != fetchURL {
+			return cloakerr.Newfh(cloakerr.LocalGit, "validate effective backend push URL",
+				"configure multiple encrypted destinations as cloak:: push URLs on the source remote; do not redirect cloak's inner carrier with pushInsteadOf",
+				"effective push URL %q differs from fetch URL %q", urlredact.URL(pushURL), urlredact.URL(fetchURL))
+		}
+	}
+	return nil
+}
+
+// URL returns a display-safe version of the host URL this mirror is bound to.
+// Transport code uses the private raw value directly.
+func (b *Backend) URL() string { return urlredact.URL(b.url) }
 
 // disablePartial removes the promisor/filter configuration after a host
 // rejected filtering, so subsequent fetches are full.
@@ -102,7 +203,7 @@ func (b *Backend) Fetch() (head string, empty bool, err error) {
 	}
 	args = append(args, "origin")
 	_, stderr, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Interactive: stdinIsTTY(),
-		MaxCapture: maxCapturedTransportBytes}, args...)
+		MaxCapture: maxCapturedTransportBytes, SensitiveURLs: []string{b.url}}, args...)
 	if err != nil {
 		return b.classifyFetchErr(stderr, err)
 	}
@@ -131,12 +232,12 @@ func (b *Backend) classifyFetchErr(stderr string, err error) (head string, empty
 	return "", false, gitx.ClassifyTransport("fetch backend branch", err)
 }
 
-// maxManifestBytes bounds how much of a manifest-sized blob ReadBlobBytes will
+// MaxManifestBytes bounds how much of a manifest-sized blob ReadBlobBytes will
 // buffer. The host serves the (untrusted) ciphertext, so without a cap a
 // malicious or broken host could force unbounded memory by serving a giant
 // manifest.age. 16 MiB is far above any honest manifest (one short JSON record
 // per live pack, capped at manifest.maxPacks) yet bounds the read.
-const maxManifestBytes = 1 << 24
+const MaxManifestBytes = 1 << 24
 
 // maxCapturedTransportBytes bounds the in-memory stdout/stderr capture for the
 // host-facing git calls (fetch/push and the lazy-fetch blob read). The host
@@ -147,18 +248,24 @@ const maxManifestBytes = 1 << 24
 // user's own repo data.
 const maxCapturedTransportBytes = 1 << 24
 
+// maxPackTreeBytes bounds the host-controlled `ls-tree <commit>:packs` output
+// materialized while constructing a new carrier commit. An honest SHA-1 tree
+// with manifest.maxPacks (16,384) fixed 64-hex filenames is under 2 MiB; extra
+// entries are unauthenticated carrier junk and must not force unbounded memory.
+const maxPackTreeBytes = 2 << 20
+
 // ReadBlobBytes returns the full content of <commit>:<path> (manifest-sized
 // blobs only; packs stream via ReadBlob). The read is bounded to
-// maxManifestBytes; an oversized blob is reported rather than buffered whole.
+// MaxManifestBytes; an oversized blob is reported rather than buffered whole.
 func (b *Backend) ReadBlobBytes(commit, path string) ([]byte, error) {
 	var buf strings.Builder
-	cap := &cappingWriter{w: &buf, limit: maxManifestBytes}
+	cap := &cappingWriter{w: &buf, limit: MaxManifestBytes}
 	if err := b.ReadBlob(commit, path, cap); err != nil {
 		return nil, err
 	}
 	if cap.overflow {
 		return nil, cloakerr.New(cloakerr.Tamper, "read remote blob "+path,
-			fmt.Errorf("blob exceeds maximum size %d bytes", int64(maxManifestBytes)))
+			fmt.Errorf("blob exceeds maximum size %d bytes", int64(MaxManifestBytes)))
 	}
 	return []byte(buf.String()), nil
 }
@@ -170,8 +277,12 @@ func (b *Backend) ReadBlobBytes(commit, path string) ([]byte, error) {
 // fetch once and retries before reporting tamper.
 func (b *Backend) ReadBlob(commit, path string, dst io.Writer) error {
 	cw := &countingWriter{w: dst}
-	_, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Stdout: cw, MaxCapture: maxCapturedTransportBytes},
+	_, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Stdout: cw, MaxCapture: maxCapturedTransportBytes,
+		SensitiveURLs: []string{b.url}},
 		"cat-file", "blob", commit+":"+path)
+	if cw.err != nil {
+		return cloakerr.New(cloakerr.LocalGit, "write remote blob "+path, cw.err)
+	}
 	if err != nil && b.partial && cw.n == 0 {
 		b.log.Warn("blob read failed under partial mirror; retrying with a full fetch", "path", path)
 		b.disablePartial()
@@ -179,8 +290,12 @@ func (b *Backend) ReadBlob(commit, path string, dst io.Writer) error {
 		if ferr != nil {
 			return ferr // already transport-classified by Fetch
 		}
-		_, _, err = b.g.Run(gitx.Opts{GitDir: b.gitDir, Stdout: cw, MaxCapture: maxCapturedTransportBytes},
+		_, _, err = b.g.Run(gitx.Opts{GitDir: b.gitDir, Stdout: cw, MaxCapture: maxCapturedTransportBytes,
+			SensitiveURLs: []string{b.url}},
 			"cat-file", "blob", commit+":"+path)
+		if cw.err != nil {
+			return cloakerr.New(cloakerr.LocalGit, "write remote blob "+path, cw.err)
+		}
 	}
 	if err != nil {
 		return classifyBlobRead(path, err)
@@ -219,11 +334,20 @@ func classifyBlobRead(path string, err error) error {
 type countingWriter struct {
 	w io.Writer
 	n int64
+	// err records a destination failure separately from git's process error so
+	// local ENOSPC/EIO is never mislabeled as host tampering.
+	err error
 }
 
 func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	c.n += int64(n)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil && c.err == nil {
+		c.err = err
+	}
 	return n, err
 }
 
@@ -277,14 +401,20 @@ func (b *Backend) PackBlobOIDs(commit string) (map[string]string, error) {
 	if commit == "" {
 		return map[string]string{}, nil
 	}
-	out, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir}, "ls-tree", commit+":packs")
+	var out strings.Builder
+	cap := &cappingWriter{w: &out, limit: maxPackTreeBytes}
+	_, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Stdout: cap}, "ls-tree", commit+":packs")
 	if err != nil {
 		if isMissingPacksTree(err) {
 			return map[string]string{}, nil
 		}
 		return nil, cloakerr.New(cloakerr.LocalGit, "list remote pack blobs", err)
 	}
-	return parsePackBlobTree(out), nil
+	if cap.overflow {
+		return nil, cloakerr.Newf(cloakerr.Tamper, "list remote pack blobs",
+			"carrier packs tree exceeds the %d-byte safety limit", maxPackTreeBytes)
+	}
+	return parsePackBlobTree(out.String()), nil
 }
 
 // isMissingPacksTree reports whether err is the "this commit carries no packs/
@@ -387,21 +517,30 @@ func (b *Backend) BuildCommit(parent, manifestOID string, packs map[string]strin
 // PushResult classifies one backend push attempt.
 type PushResult int
 
+// ErrPushOutcomeUnknown marks the failure mode where the push transport died
+// without a per-ref result and a follow-up carrier probe also failed. The host
+// may have committed the attempted ref update; rekey callers need distinct
+// recovery guidance because neither old nor new key can be selected safely.
+var ErrPushOutcomeUnknown = errors.New("backend push outcome is unknown; the carrier may have accepted the attempted commit")
+
 const (
 	// PushOK: the ref updated.
 	PushOK PushResult = iota
-	// PushCASLost: the remote moved (non-fast-forward, stale info, or
-	// failed ref lock); re-fetch and retry.
+	// PushCASLost: a rejected update was followed by a fresh probe that found
+	// the remote at a different head than the caller expected; re-fetch and retry.
 	PushCASLost
 	// PushFailed: transport or other failure; see error.
 	PushFailed
 )
 
-// PushFF pushes commit to the backend branch as a plain fast-forward push.
-// Git's client FF check against the fresh advertisement plus the server's
-// reference-changed-since-discovery rejection make this a compare-and-swap.
-func (b *Backend) PushFF(commit string) (PushResult, error) {
-	return b.push(commit, "")
+// PushFF pushes a commit which is expected to be a fast-forward while still
+// enforcing an exact carrier compare-and-swap. expectedOldOID is the tip on
+// which commit was built; "" asserts that the branch must not exist. The lease
+// is required even for a descendant commit because a concurrent actor could
+// delete or rewind the carrier ref, after which a plain fast-forward/create
+// would otherwise succeed and hide that unexpected state change.
+func (b *Backend) PushFF(commit, expectedOldOID string) (PushResult, error) {
+	return b.push(commit, expectedOldOID)
 }
 
 // PushLease force-pushes commit (squash/repack/rekey) guarded by an
@@ -410,49 +549,165 @@ func (b *Backend) PushLease(commit, expectedOldOID string) (PushResult, error) {
 	return b.push(commit, expectedOldOID)
 }
 
-// pushArgs builds the only two backend push command lines that can exist:
-// plain fast-forward, or force-with-lease with an explicit expected value.
-// A plain --force is structurally impossible; a unit test pins this.
-func pushArgs(branch, commit, lease string) []string {
-	args := []string{"push", "--porcelain"}
-	if lease != "" {
-		args = append(args, "--force-with-lease=refs/heads/"+branch+":"+lease)
-	}
+// pushArgs builds the sole backend push form: force-with-lease carrying an
+// explicit expected value. An empty expected value asserts branch absence. A
+// plain --force or unguarded fast-forward push is structurally impossible.
+func pushArgs(branch, commit, expectedOldOID string) []string {
+	args := []string{"push", "--porcelain",
+		"--force-with-lease=refs/heads/" + branch + ":" + expectedOldOID}
 	return append(args, "origin", commit+":refs/heads/"+branch)
 }
 
-func (b *Backend) push(commit, lease string) (PushResult, error) {
-	args := pushArgs(b.branch, commit, lease)
+func (b *Backend) push(commit, expectedOldOID string) (result PushResult, retErr error) {
+	result = PushFailed
+	defer func() {
+		if result == PushOK {
+			return
+		}
+		if err := b.pruneUnreachable(); err != nil {
+			result = PushFailed
+			retErr = errors.Join(retErr, err)
+		}
+	}()
+	args := pushArgs(b.branch, commit, expectedOldOID)
 	stdout, stderr, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Interactive: stdinIsTTY(),
-		MaxCapture: maxCapturedTransportBytes}, args...)
+		MaxCapture: maxCapturedTransportBytes, SensitiveURLs: []string{b.url}}, args...)
 	if err == nil {
 		return PushOK, nil
 	}
-	// A host file-size rejection is a hard failure -- surface it as a clear
-	// TooLarge error -- not a compare-and-swap loss, even though it too renders
-	// as a porcelain "!" rejection, so it is classified BEFORE the CAS check.
-	if hostFileLimitRejection(stdout, stderr) {
-		return PushFailed, classifyPushFailure(stdout, stderr, err)
-	}
-	// A porcelain "!" rejection line for our branch means the host received the
-	// push and refused the ref update. The backend branch only ever moves via a
-	// cloak push, so any ref refusal (server-side mid-connection, or git's own
-	// stale-advertisement check) can only mean the branch advanced since
-	// discovery: a lost compare-and-swap. Re-fetch and retry.
+	// A porcelain "!" only proves that the ref update was rejected. It does not
+	// identify why: branch protection, a pre-receive hook, and a stale ref all
+	// use the same flag. Probe the actual carrier head and retry only when it no
+	// longer matches the head the caller built on. A stable head means policy or
+	// another hard rejection, whose original diagnostic must reach the user.
 	if backendRefRejected(stdout, b.branch) {
-		b.log.Info("backend push lost compare-and-swap")
-		return PushCASLost, nil
+		probed, probeErr := b.probePushResult(commit, expectedOldOID)
+		if probeErr != nil {
+			return PushFailed, probeErr
+		}
+		switch probed {
+		case PushOK:
+			b.log.Warn("backend reported a rejected push but the carrier now points at the attempted commit; treating it as accepted")
+			return PushOK, nil
+		case PushCASLost:
+			b.log.Info("backend push lost compare-and-swap")
+			return PushCASLost, nil
+		}
+		if hostFileLimitRejection(stdout, stderr) {
+			return PushFailed, classifyPushFailure(stdout, stderr, err)
+		}
+		return PushFailed, classifyStableRefRejection(err)
 	}
 	// No ref-level rejection line: the transport failed before git could report
-	// per-ref status (host unreachable, auth failure, dropped connection).
+	// per-ref status. Probe once: a connection can drop after the server commits
+	// the update but before Git reports success. Confirming the exact attempted
+	// oid prevents rekey from leaving the local repo configured with the old key.
+	if probed, probeErr := b.probePushResult(commit, expectedOldOID); probeErr == nil {
+		switch probed {
+		case PushOK:
+			b.log.Warn("backend push transport failed after the carrier accepted the attempted commit; treating it as accepted")
+			return PushOK, nil
+		case PushCASLost:
+			b.log.Info("backend moved while push outcome was ambiguous; retrying as a lost compare-and-swap")
+			return PushCASLost, nil
+		}
+	} else {
+		b.log.Warn("could not resolve ambiguous backend push outcome", "err", probeErr)
+		return PushFailed, errors.Join(
+			ErrPushOutcomeUnknown,
+			classifyPushFailure(stdout, stderr, err),
+			fmt.Errorf("confirm backend head after ambiguous push: %w", probeErr),
+		)
+	}
 	return PushFailed, classifyPushFailure(stdout, stderr, err)
+}
+
+// pruneUnreachable removes loose candidate objects left by interrupted,
+// rejected, or CAS-losing pushes. The private mirror is serialized by cloak's
+// per-remote lock in production, and gc.auto is disabled above, so no other Git
+// writer should race this reachability sweep. Remote state remains rooted at
+// remoteHeadRef and can always be fetched again from the carrier.
+func (b *Backend) pruneUnreachable() error {
+	if _, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Scrub: true},
+		"prune", "--expire=now"); err != nil {
+		return cloakerr.New(cloakerr.LocalGit, "prune unreachable backend objects", err)
+	}
+	return nil
+}
+
+// probePushResult queries the host after a failed/ambiguous push. The exact
+// attempted commit proves acceptance; a head different from the expected old
+// state is a lost CAS; an unchanged head leaves the original failure in force.
+// expectedOldOID == "" represents an absent branch. The query is independent
+// of the mirror's tracking ref, which may still hold the last fetched state.
+func (b *Backend) probePushResult(commit, expectedOldOID string) (PushResult, error) {
+	ref := "refs/heads/" + b.branch
+	stdout, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Interactive: stdinIsTTY(),
+		MaxCapture: maxCapturedTransportBytes, SensitiveURLs: []string{b.url}},
+		"ls-remote", "--refs", "origin", ref)
+	if err != nil {
+		return PushFailed, gitx.ClassifyTransport("inspect backend head after rejected push", err)
+	}
+	head, exists, err := parseRemoteHead(stdout, ref)
+	if err != nil {
+		return PushFailed, err
+	}
+	return classifyProbedPushState(commit, expectedOldOID, head, exists), nil
+}
+
+func classifyProbedPushState(commit, expectedOldOID, head string, exists bool) PushResult {
+	if exists && head == commit {
+		return PushOK
+	}
+	if expectedOldOID == "" {
+		if exists {
+			return PushCASLost
+		}
+		return PushFailed
+	}
+	if !exists || head != expectedOldOID {
+		return PushCASLost
+	}
+	return PushFailed
+}
+
+// classifyStableRefRejection reports a porcelain rejection whose follow-up
+// probe found the carrier ref unchanged. It is deliberately non-retryable even
+// if host-controlled hook text happens to contain a network/auth marker: the
+// successful probe has established that this was not CAS contention, and the
+// original git error retains the host's actionable diagnostic.
+func classifyStableRefRejection(err error) error {
+	return cloakerr.New(cloakerr.LocalGit, "push backend branch rejected by host", err).WithHint(
+		"the carrier ref did not change; check branch protection, pre-receive hooks, repository permissions, and host policy")
+}
+
+// parseRemoteHead parses the exact-ref output of `git ls-remote --refs`.
+// Honest output is either empty (the branch is absent) or one `<oid> <ref>`
+// line. Anything else is ambiguous remote data and fails closed rather than
+// guessing whether a rejected push is safe to retry.
+func parseRemoteHead(stdout, expectedRef string) (head string, exists bool, err error) {
+	trimmed := strings.TrimSpace(stdout)
+	if trimmed == "" {
+		return "", false, nil
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) != 1 {
+		return "", false, cloakerr.Newf(cloakerr.Protocol, "inspect backend head after rejected push",
+			"host advertised %d entries for exact ref %s", len(lines), expectedRef)
+	}
+	fields := strings.Fields(lines[0])
+	if len(fields) != 2 || fields[0] == "" || fields[1] != expectedRef {
+		return "", false, cloakerr.Newf(cloakerr.Protocol, "inspect backend head after rejected push",
+			"host returned malformed exact-ref advertisement for %s", expectedRef)
+	}
+	return fields[0], true, nil
 }
 
 // hostFileLimitMarkers are substrings a host prints when it refuses a push
 // because a file (one encrypted pack blob) exceeds its per-file size cap. The
 // combined push output is lowercased before matching, so these are written in
-// lower case. Plain substrings, not a regex (mirroring casLostMarkers below):
-// each is a fixed phrase. GitHub prints "GH001: Large files detected" and
+// lower case. Plain substrings, not a regex: each is a fixed phrase. GitHub
+// prints "GH001: Large files detected" and
 // "exceeds GitHub's file size limit of 100.00 MB"; git's own receive.maxInputSize
 // guard prints "pack exceeds maximum allowed size".
 var hostFileLimitMarkers = []string{
@@ -506,15 +761,11 @@ func hostFileLimitRejection(stdout, stderr string) bool {
 // and git renders a refused ref update with a "!" flag whatever the host's
 // reason. That flag and the line structure are produced LOCALLY by git's push
 // machinery, so -- unlike the parenthesised reason text, which is relayed
-// verbatim from the untrusted host -- a hostile host can neither forge a "!" to
-// trigger a spurious retry nor suppress one to mask a genuine compare-and-swap
-// loss. Only stdout is scanned (the host's "remote:" sideband lands on stderr
-// and never begins with "!\t"), and the match is anchored to our branch's "to"
-// ref so an unrelated ref's status never counts. The earlier marker-substring
-// scan was replaced because a server-side mid-connection rejection reports its
-// reason ("cannot lock ref ...") only on a "remote:" line, which the
-// sideband-stripping anti-spoofing guard correctly discarded -- leaving no
-// marker and misclassifying the lost CAS as a hard failure.
+// verbatim from the untrusted host -- it is a trustworthy signal to perform a
+// fresh head probe. It is not itself proof of a CAS loss. Only stdout is scanned
+// (the host's "remote:" sideband lands on stderr and never begins with "!\t"),
+// and the match is anchored to our branch's "to" ref so an unrelated ref's
+// status never counts.
 func backendRefRejected(porcelainStdout, branch string) bool {
 	want := "refs/heads/" + branch
 	for _, line := range strings.Split(porcelainStdout, "\n") {

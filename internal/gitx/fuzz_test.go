@@ -27,12 +27,11 @@
 //
 // A fifth target, FuzzApplyGitEnv, covers applyGitEnv, the pure core of
 // buildEnv (every git invocation's environment). Its load-bearing security
-// contract is GIT_DIR isolation: it drops every GIT_DIR= entry inherited from
-// cloak's own environment so a stray parent GIT_DIR can never silently redirect
-// the git subprocess to the wrong object store, and re-sets GIT_DIR only from
-// the explicit o.GitDir/o.Env the caller chose. Extracted from buildEnv
-// (behavior-preserving) so the parent environment is fuzz-controllable without
-// mutating the process environment.
+// contract is GIT_DIR isolation plus command-transport denial: it drops every
+// inherited GIT_DIR and caller-controlled GIT_ALLOW_PROTOCOL, then installs a
+// fixed built-in transport whitelist. It re-sets GIT_DIR only from explicit
+// o.GitDir/o.Env. Extracted from buildEnv so the parent environment is
+// fuzz-controllable without mutating the process.
 package gitx
 
 import (
@@ -403,8 +402,8 @@ func gitDirLines(env []string) []string {
 func FuzzApplyGitEnv(f *testing.F) {
 	// Seeds exercise an empty parent, a parent carrying a stale inherited
 	// GIT_DIR (the security-critical drop), an explicit o.GitDir, scrub on, an
-	// o.Env that itself re-sets GIT_DIR (a deliberate caller override that must
-	// survive), and near-miss prefixes that must be kept verbatim.
+	// o.Env that attempts to re-set GIT_DIR (which must also be dropped), and
+	// near-miss prefixes that must be kept verbatim.
 	type seed struct {
 		parentBlob, gitDir, envBlob string
 		scrub                       bool
@@ -418,6 +417,8 @@ func FuzzApplyGitEnv(f *testing.F) {
 		{"GIT_DIRX=keep\nGITDIR=keep\nX=GIT_DIR=keep", "/r/.git", "", false, 0},
 		{"A=1\nB=2", "scratch.git", "LANG=C\nGIT_DIR=/env/dir", true, 1},
 		{"COLOR=1", "", "", true, 3},
+		{"GIT_ALLOW_PROTOCOL=ssh:ext:fd:https", "", "", false, 0},
+		{"GIT_OBJECT_DIRECTORY=/source/objects", "/repo/.git", "GIT_ALTERNATE_OBJECT_DIRECTORIES=/other", false, 0},
 	}
 	for _, s := range seeds {
 		f.Add(s.parentBlob, s.gitDir, s.envBlob, s.scrub, s.inject)
@@ -445,54 +446,53 @@ func FuzzApplyGitEnv(f *testing.F) {
 }
 
 // assertAppliedGitEnv verifies the full applyGitEnv contract for one (parent, o)
-// pair: GIT_DIR isolation (only cloak's deliberate o.GitDir/o.Env entries
-// survive, never an inherited parent GIT_DIR), verbatim preservation and
-// ordering of the non-GIT_DIR parent segment, the o.Env trailing segment, the
-// scrub config-disable vars, and determinism. Extracted from FuzzApplyGitEnv to
-// keep that fuzz body under the cyclomatic-complexity budget; every assertion is
-// unchanged.
+// pair: GIT_DIR isolation, removal of caller-controlled protocol whitelists,
+// deterministic ordering, the scrub variables, and cloak's final fixed
+// transport whitelist.
 func assertAppliedGitEnv(t *testing.T, got, parent []string, o Opts) {
 	t.Helper()
 	gitDir, extra, scrub := o.GitDir, o.Env, o.Scrub
 
 	// (1) GIT_DIR isolation - the load-bearing security harm statement. The
-	// only GIT_DIR= entries permitted in the child environment are the ones
-	// cloak sets deliberately: o.GitDir (when non-empty, added first) followed
-	// by any GIT_DIR= entry the caller put in o.Env. A GIT_DIR inherited from
-	// the parent environment must NEVER survive, or it would silently point
-	// the git subprocess at the wrong object store. Derived purely from
-	// o.GitDir/o.Env (never the parent), so a dropped drop is caught.
+	// only GIT_DIR= entry permitted in the child environment is the one cloak
+	// sets deliberately through o.GitDir. Parent and o.Env redirections must
+	// never survive or they could point a backend command at the source store.
 	var wantGitDirs []string
 	if gitDir != "" {
 		wantGitDirs = append(wantGitDirs, "GIT_DIR="+gitDir)
 	}
-	wantGitDirs = append(wantGitDirs, gitDirLines(extra)...)
 	if g := gitDirLines(got); !slices.Equal(g, wantGitDirs) {
 		t.Fatalf("GIT_DIR entries = %q, want %q (a parent GIT_DIR must never survive)\nparent: %q\ngitDir: %q\nenv: %q",
 			g, wantGitDirs, parent, gitDir, extra)
 	}
 
-	// (2) Preservation + ordering (a different decomposition than the build
-	// loop): every NON-GIT_DIR parent entry is kept verbatim and in order at
-	// the front of the result - cloak strips only the inherited GIT_DIR, never
-	// drops or rewrites other inherited config (transport config like
-	// core.sshCommand must keep working).
+	// (2) Preservation + ordering: every ordinary parent entry is kept verbatim;
+	// inherited protocol whitelists are controlled state and must be removed.
 	var kept []string
 	for _, kv := range parent {
-		if !strings.HasPrefix(kv, "GIT_DIR=") {
-			kept = append(kept, kv)
+		if isRepositoryRedirectEnv(kv) || strings.HasPrefix(kv, "GIT_ALLOW_PROTOCOL=") {
+			continue
 		}
+		kept = append(kept, kv)
 	}
 	if len(got) < len(kept) || !slices.Equal(got[:len(kept)], kept) {
 		t.Fatalf("non-GIT_DIR parent entries not preserved as the leading segment\nparent: %q\ngot: %q", parent, got)
 	}
 
-	// (3) o.Env is appended verbatim as the trailing segment - the caller's
-	// explicit environment wins and is never reordered or dropped.
-	if len(extra) > 0 {
-		if len(got) < len(extra) || !slices.Equal(got[len(got)-len(extra):], extra) {
-			t.Fatalf("o.Env not preserved verbatim as the trailing segment\nenv: %q\ngot: %q", extra, got)
+	// (3) o.Env follows the configured entries, except a caller-controlled
+	// protocol whitelist is removed. cloak's whitelist is the final entry.
+	var wantExtra []string
+	for _, kv := range extra {
+		if !isRepositoryRedirectEnv(kv) && !strings.HasPrefix(kv, "GIT_ALLOW_PROTOCOL=") {
+			wantExtra = append(wantExtra, kv)
 		}
+	}
+	if len(got) < len(wantExtra)+1 ||
+		!slices.Equal(got[len(got)-len(wantExtra)-1:len(got)-1], wantExtra) {
+		t.Fatalf("o.Env not preserved before the fixed protocol whitelist\nenv: %q\ngot: %q", extra, got)
+	}
+	if got[len(got)-1] != "GIT_ALLOW_PROTOCOL="+allowedGitProtocols {
+		t.Fatalf("final protocol whitelist = %q, want %q", got[len(got)-1], "GIT_ALLOW_PROTOCOL="+allowedGitProtocols)
 	}
 
 	// (4) Scrub harm statement (one-sided): when set, both config-disabling

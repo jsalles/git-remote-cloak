@@ -13,7 +13,12 @@ replacement for `git-remote-gcrypt` with safe concurrent pushes
 (compare-and-swap), rollback/replay detection, repo-identity pinning, and
 typed error reporting.
 
-- Module: `github.com/b4ryon/git-remote-cloak`, Go 1.26+.
+- Module: `github.com/b4ryon/git-remote-cloak`; the `go.mod` directive requires
+  Go 1.26.6. Direct dependency versions are
+  authoritative in `go.mod`/`go.sum`: `filippo.io/age` v1.3.2,
+  `golang.org/x/crypto` v0.57.0, `golang.org/x/term` v0.46.0, and
+  `golang.org/x/text` v0.42.0. Do not silently downgrade them or replace the
+  embedded library with the `age` CLI.
 - Entry point: `cmd/git-remote-cloak` (the helper binary; also symlinked as
   `git-cloak` for the CLI subcommands).
 - The helper speaks git's remote-helper protocol over stdin/stdout for
@@ -24,9 +29,11 @@ typed error reporting.
 
 ## Setup and build commands
 
-Prerequisites: Go 1.26+ and git. On macOS, Xcode command line tools
-(`xcode-select --install`) are needed for the cgo Keychain/Touch ID key
-backend; Linux builds are pure Go and use a key file.
+Prerequisites: git and Go 1.26.6 or newer, or a compatible older Go launcher
+with automatic toolchain selection enabled so it can honor the `go` directive.
+On macOS, Xcode command line tools (`xcode-select --install`) are needed for
+the cgo Keychain/Touch ID key backend; Linux builds are pure Go and use a key
+file.
 
 - Build: `make build` (outputs `bin/git-remote-cloak` and the `bin/git-cloak`
   symlink).
@@ -37,8 +44,9 @@ backend; Linux builds are pure Go and use a key file.
   access to vuln.go.dev).
 - Clean: `make clean`.
 
-Do not run `go build`/`go install` with a hand-written version. The build
-version is injected from the latest git tag via `-ldflags`; see Versioning.
+Do not run `go build`/`go install` with a hand-written version. `make` derives
+the build's tag/commit/dirty identity and injects it via `-ldflags`; see
+Versioning.
 
 ## Testing instructions
 
@@ -73,7 +81,8 @@ security suite) where the change touches fetch/push/protocol behavior.
     so the cause chain is preserved (`%w`, never `%v`).
   - Classify domain errors with `cloakerr.New`/`cloakerr.Newf` and the right
     `Kind` (`Auth`, `Network`, `RepoNotFound`, `Tamper`, `Rollback`,
-    `CASExhausted`, `LocalGit`, `KeyUnavailable`, `Crypto`, `Protocol`).
+    `CASExhausted`, `LocalGit`, `KeyUnavailable`, `Crypto`, `Protocol`,
+    `TooLarge`).
   - Detect sentinels through `errors.As`/`errors.Is`, not direct type
     assertions like `err.(*gitx.GitError)`, so a wrapped error is still
     recognized (see `config.isNoMatchingKeys`, `backend.isMissingPacksTree`).
@@ -99,6 +108,7 @@ security suite) where the change touches fetch/push/protocol behavior.
 - `internal/setup` - session open/validation (CheckPin, CheckRepoID).
 - `internal/cloakerr` - typed error Kinds and helpers (`KindOf`, `WithHintOn`).
 - `internal/gitx` - thin wrapper around invoking git.
+- `internal/urlredact` - credential-safe URL rendering for diagnostics.
 - `internal/geometry`, `internal/logx`, `internal/userpresence`,
   `internal/version` - support packages.
 - `test/integration`, `test/security`, `test/e2e`, `test/harness` - black-box
@@ -119,15 +129,43 @@ This is a security tool; correctness of these invariants is the point.
 - Never log, print, or commit secrets: the symmetric key, key material, or
   plaintext repository contents. Scratch files holding plaintext live under the
   state TmpDir and are removed; keep it that way.
+- Reject credential-bearing backend URLs. HTTP(S) userinfo and transport URLs
+  containing passwords, queries, or fragments must fail before contact; SSH
+  usernames remain supported. Keep redaction at every diagnostic boundary as
+  defense in depth, and mark any raw URL argument with `SensitiveURLs` /
+  `SensitiveArgs`. User-facing examples should prefer SSH URLs and tell HTTPS
+  users to rely on Git credential helpers.
+- Keep backend transports allowlisted. Git executes `git-remote-<scheme>` for
+  unknown `scheme://` URLs as well as explicit `scheme::` helper syntax; both
+  forms must be rejected, and child Git processes must retain the fixed
+  `GIT_ALLOW_PROTOCOL` whitelist.
+- Git LFS is unsupported and unsafe for cloak repositories: LFS objects use a
+  separate transport and bypass cloak encryption. Never recommend LFS as a
+  pack-size workaround. Session setup rejects tracked `filter=lfs` attributes
+  and standard Git LFS pre-push hooks; do not weaken those checks.
+- Pin advancement must remain evidence-based. The fetch path pins only after
+  pack application/request verification; a list-only repair requires the full
+  advertised object closure locally; explicit rollback/repository-change
+  acceptance verifies every live pack before pinning. Do not replace any of
+  these with manifest-only validation.
+- Repack and rekey produce a size-bounded pack set, not necessarily one pack.
+  Headless `key delete`, `rekey`, `accept-rollback`, and
+  `accept-repo-change` require an explicit `--force-insecure`; do not weaken
+  that gate for automation.
+- Do not overstate rollback protection. Pins are per-client TOFU state and do
+  not detect a Byzantine host maintaining separate, monotonically advancing
+  views for different clients. Rekey changes current/future ciphertext but
+  cannot revoke old ciphertext retained by a host, backup, or attacker.
 - Prefer the existing scratch-file and `TmpDir()` plumbing so plaintext never
   lands on a separate, possibly unencrypted volume.
 
 ## Versioning and release
 
-- The version is tag-driven: `make` derives it from `git describe --tags
-  --abbrev=0` and injects it via `-ldflags` into
-  `internal/version.Version`. Do not hardcode a version in `version.go` (it
-  must stay an uninitialized `var` for `-X` to work).
+- The version is source-identity-driven: `make` derives it from `git describe
+  --tags --always --dirty` and injects it via `-ldflags` into
+  `internal/version.Version`. Tagged clean releases show the tag; development
+  builds include commit/dirtiness instead of impersonating the previous
+  release. Do not hardcode a version in `version.go`.
 - Bumping the version means creating an annotated tag, for example
   `git tag -a v0.2.3 -m "Release v0.2.3"`, plus updating the version strings in
   `README.md`. Release artifacts: `make release` (signed darwin/arm64 + static

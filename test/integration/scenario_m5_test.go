@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/b4ryon/git-remote-cloak/test/harness"
 )
@@ -38,9 +39,9 @@ func TestScenario4RollbackInjection(t *testing.T) {
 		t.Fatalf("rollback not reported as an alarm: %s", stderr)
 	}
 
-	// accept-rollback (non-interactive: presence check is skipped) clears
-	// the pin; the next fetch then succeeds at the lower generation.
-	out, errb, err := b.Cloak("accept-rollback", "--remote", "origin")
+	// accept-rollback with an explicit headless-test bypass clears the pin; the
+	// next fetch then succeeds at the lower generation.
+	out, errb, err := b.Cloak("accept-rollback", "--remote", "origin", "--force-insecure")
 	if err != nil {
 		t.Fatalf("accept-rollback failed: %v\n%s", err, errb)
 	}
@@ -75,7 +76,7 @@ func TestCorruptPinSurfacedAndRecoverable(t *testing.T) {
 		t.Fatalf("corrupt pin not surfaced on fetch: %s", stderr)
 	}
 
-	out, errb, err := b.Cloak("accept-rollback", "--remote", "origin")
+	out, errb, err := b.Cloak("accept-rollback", "--remote", "origin", "--force-insecure")
 	if err != nil {
 		t.Fatalf("accept-rollback failed: %v\n%s", err, errb)
 	}
@@ -87,6 +88,60 @@ func TestCorruptPinSurfacedAndRecoverable(t *testing.T) {
 	}
 	if _, _, err := b.Git("fetch", "origin"); err != nil {
 		t.Fatalf("fetch still failing after accept-rollback: %v", err)
+	}
+}
+
+func TestRekeySwitchesLocalKeyAfterPostPushStateFailure(t *testing.T) {
+	host, _, a := pushSetup(t)
+	newKey := filepath.Join(t.TempDir(), "rotated.key")
+	a.MustCloak("keygen", "--key", "file:"+newKey)
+
+	hold := t.TempDir()
+	type result struct {
+		stderr string
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		_, stderr, err := a.GitEnv([]string{"CLOAK_TEST_HOLD_BEFORE_PUSH=" + hold},
+			"cloak", "rekey", "--remote", "origin", "--new-key", "file:"+newKey, "--force-insecure")
+		done <- result{stderr: stderr, err: err}
+	}()
+	waitForFile(t, filepath.Join(hold, "waiting"), 15*time.Second)
+
+	// Setup has already read the old pins. Turn the generation destination into
+	// a directory so the post-PushOK SavePins step fails deterministically.
+	generationPath := filepath.Join(a.Dir, ".git", "cloak", "origin", "generation")
+	if err := os.Remove(generationPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(generationPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "release"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := <-done
+	if got.err == nil {
+		t.Fatal("rekey hid the post-push local-state failure")
+	}
+	if !strings.Contains(got.stderr, "remote rekeyed") || !strings.Contains(got.stderr, "local verification state") {
+		t.Fatalf("rekey failure did not explain the committed remote state: %s", got.stderr)
+	}
+	if ref := a.MustGit("config", "--get", "cloak.keyRef"); ref != "file:"+newKey {
+		t.Fatalf("cloak.keyRef remained %q after committed rekey, want new key", ref)
+	}
+
+	// Repair the injected filesystem fault. The next fetch must decrypt with the
+	// new key and restore the missing pin from the complete local object closure.
+	if err := os.RemoveAll(generationPath); err != nil {
+		t.Fatal(err)
+	}
+	a.MustGit("fetch", "origin")
+	b := harness.NewClient(t, "post-failure-new-key", newKey)
+	b.MustClone(host.Dir)
+	if b.HeadOID() != a.HeadOID() {
+		t.Fatalf("new-key clone HEAD %s != source %s", b.HeadOID(), a.HeadOID())
 	}
 }
 
@@ -132,12 +187,11 @@ func solePinPath(t *testing.T, c *harness.Client) string {
 	return soleStateFile(t, c, "generation", "pin file")
 }
 
-// TestAcceptRollbackRestoresPinWhenRevalidationFails proves accept-rollback does
-// not leave the remote unprotected (reverted to TOFU) when its post-clear
-// re-validation fails: it clears the pin, fails to re-load a corrupted remote,
-// and restores the original pin. Without the restore the failed accept would
-// silently drop rollback protection.
-func TestAcceptRollbackRestoresPinWhenRevalidationFails(t *testing.T) {
+// TestAcceptRollbackPreservesPinWhenValidationFails proves accept-rollback
+// leaves the old trust anchor installed while reading and validating the
+// candidate remote. A corrupt candidate must never downgrade the client to
+// trust-on-first-use.
+func TestAcceptRollbackPreservesPinWhenValidationFails(t *testing.T) {
 	host, key, a := pushSetup(t)
 	a.WriteFile("more.md", "second push\n")
 	a.Commit("c1")
@@ -153,21 +207,21 @@ func TestAcceptRollbackRestoresPinWhenRevalidationFails(t *testing.T) {
 		t.Fatalf("no rollback pin after clone: %v", err)
 	}
 
-	// Corrupt the host manifest so accept-rollback's re-validation (LoadRemote ->
-	// manifest decrypt) fails AFTER it has cleared the pin, exercising restore.
+	// Corrupt the host manifest so candidate validation fails before any pin is
+	// replaced.
 	garbage := host.HashObjectStdin(t, []byte("not a valid manifest"))
 	host.ReplaceTreeEntry(t, "cloak", "manifest.age", garbage)
 
-	if _, errb, cerr := b.Cloak("accept-rollback", "--remote", "origin"); cerr == nil {
+	if _, errb, cerr := b.Cloak("accept-rollback", "--remote", "origin", "--force-insecure"); cerr == nil {
 		t.Fatalf("accept-rollback unexpectedly succeeded against a corrupt remote: %s", errb)
 	}
 
 	got, err := os.ReadFile(pinPath)
 	if err != nil {
-		t.Fatalf("rollback pin was not restored after the failed accept-rollback: %v", err)
+		t.Fatalf("rollback pin disappeared after the failed accept-rollback: %v", err)
 	}
 	if !bytes.Equal(got, orig) {
-		t.Fatalf("restored pin %q does not match the original %q", got, orig)
+		t.Fatalf("preserved pin %q does not match the original %q", got, orig)
 	}
 }
 

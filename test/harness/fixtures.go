@@ -116,11 +116,22 @@ func (h *Host) HashObjectStdin(t *testing.T, data []byte) string {
 // commit keeps the original's parent, author/committer identity, and dates,
 // so only ciphertext changes (chain position and generation are untouched).
 func (h *Host) ReplaceTreeEntry(t *testing.T, branch, path, newBlobOID string) {
+	h.rewriteTreeEntry(t, branch, path, newBlobOID, false)
+}
+
+// RemoveTreeEntry rewrites branch's tip into a tampered commit that omits
+// path while preserving the original commit's parent and metadata. Security
+// tests use it to model a host withholding a blob promised by the manifest.
+func (h *Host) RemoveTreeEntry(t *testing.T, branch, path string) {
+	h.rewriteTreeEntry(t, branch, path, "", true)
+}
+
+func (h *Host) rewriteTreeEntry(t *testing.T, branch, path, newBlobOID string, remove bool) {
 	t.Helper()
 	tip := h.Git("rev-parse", branch)
 	// Read the full recursive tree, swap the target entry, rebuild trees.
 	lsOut := h.Git("ls-tree", "-r", tip)
-	newTree := h.mktreeRecursive(t, rewriteTreeFlat(t, lsOut, path, newBlobOID))
+	newTree := h.mktreeRecursive(t, rewriteTreeFlat(t, lsOut, path, newBlobOID, remove))
 	parents := strings.Fields(h.Git("rev-list", "--parents", "-n", "1", tip))
 	commitArgs := []string{"commit-tree", newTree, "-m", "cloak"}
 	for _, p := range parents[1:] {
@@ -142,8 +153,9 @@ func (h *Host) ReplaceTreeEntry(t *testing.T, branch, path, newBlobOID string) {
 }
 
 // rewriteTreeFlat parses recursive ls-tree output and returns flat
-// "mode type oid\tpath" lines with the entry at path repointed to newBlobOID.
-func rewriteTreeFlat(t *testing.T, lsOut, path, newBlobOID string) string {
+// "mode type oid\tpath" lines with the entry at path repointed to newBlobOID,
+// or omitted when remove is true.
+func rewriteTreeFlat(t *testing.T, lsOut, path, newBlobOID string, remove bool) string {
 	t.Helper()
 	var b strings.Builder
 	for _, line := range strings.Split(lsOut, "\n") {
@@ -157,6 +169,9 @@ func rewriteTreeFlat(t *testing.T, lsOut, path, newBlobOID string) string {
 		}
 		mode, typ, oid := fields[0], fields[1], fields[2]
 		if name == path {
+			if remove {
+				continue
+			}
 			oid = newBlobOID
 		}
 		fmt.Fprintf(&b, "%s %s %s\t%s\n", mode, typ, oid, name)

@@ -65,6 +65,12 @@ func TestStanzaFormatPinned(t *testing.T) {
 	if saltSize != 32 {
 		t.Fatalf("saltSize = %d, want 32", saltSize)
 	}
+	if ageFileKeySize != 16 {
+		t.Fatalf("ageFileKeySize = %d, want 16", ageFileKeySize)
+	}
+	if wrappedFileKeySize != ageFileKeySize+16 {
+		t.Fatalf("wrappedFileKeySize = %d, want %d", wrappedFileKeySize, ageFileKeySize+16)
+	}
 	if wrapLabel != "cloak/v1 wrap" {
 		t.Fatalf("wrapLabel = %q, want %q", wrapLabel, "cloak/v1 wrap")
 	}

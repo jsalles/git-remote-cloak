@@ -36,6 +36,29 @@ func TestVersionCommand(t *testing.T) {
 	}
 }
 
+func TestDescribeTargetRedactsCredentialURL(t *testing.T) {
+	const rawURL = "cloak::https://alice-sentinel:password-sentinel@example.invalid/repo.git?token=token-sentinel#fragment-sentinel"
+	got := describeTarget("origin", rawURL)
+	if want := "origin cloak::https://example.invalid/repo.git"; got != want {
+		t.Fatalf("describeTarget = %q, want %q", got, want)
+	}
+}
+
+func TestAcceptCommandsRequireExplicitNonInteractiveBypass(t *testing.T) {
+	skipIfInteractive(t)
+	for _, command := range []string{"accept-rollback", "accept-repo-change"} {
+		t.Run(command, func(t *testing.T) {
+			code, _, errb := run(t, []string{command}, "")
+			if code == 0 {
+				t.Fatalf("%s succeeded non-interactively without --force-insecure", command)
+			}
+			if !strings.Contains(errb.String(), "--force-insecure") {
+				t.Fatalf("%s refusal did not explain the explicit bypass: %q", command, errb.String())
+			}
+		})
+	}
+}
+
 func TestKeyLifecycle(t *testing.T) {
 	skipIfInteractive(t)
 	dir := t.TempDir()
@@ -96,6 +119,10 @@ type failingReader struct{ err error }
 
 func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
 
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
 func TestKeyImportSurfacesStdinReadError(t *testing.T) {
 	ref := "file:" + filepath.Join(t.TempDir(), "key")
 	sentinel := errors.New("stdin pipe broke")
@@ -112,6 +139,23 @@ func TestKeyImportSurfacesStdinReadError(t *testing.T) {
 	}
 	if _, err := os.Stat(ref[len("file:"):]); err == nil {
 		t.Fatal("a key file was written despite the stdin read failure")
+	}
+}
+
+func TestKeyExportSurfacesOutputWriteError(t *testing.T) {
+	skipIfInteractive(t)
+	ref := "file:" + filepath.Join(t.TempDir(), "key")
+	if code, _, errb := run(t, []string{"keygen", "--key", ref}, ""); code != 0 {
+		t.Fatalf("keygen: %s", errb.String())
+	}
+	sentinel := errors.New("backup disk full")
+	var errb bytes.Buffer
+	code := cmdKeyExport([]string{"--key", ref, "--force-insecure"}, failingWriter{sentinel}, &errb)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if !strings.Contains(errb.String(), "write exported key") || !strings.Contains(errb.String(), sentinel.Error()) {
+		t.Fatalf("stderr does not surface export write failure: %q", errb.String())
 	}
 }
 
@@ -140,7 +184,7 @@ func TestKeyDeleteConfirmation(t *testing.T) {
 	}
 
 	// A non-YES answer aborts and leaves the key in place.
-	code, _, errb := run(t, []string{"key", "delete", "--key", ref}, "no\n")
+	code, _, errb := run(t, []string{"key", "delete", "--key", ref, "--force-insecure"}, "no\n")
 	if code == 0 {
 		t.Fatal("delete proceeded without a YES confirmation")
 	}
@@ -152,7 +196,7 @@ func TestKeyDeleteConfirmation(t *testing.T) {
 	}
 
 	// Lowercase "yes" must not count: caps are enforced.
-	if code, _, _ := run(t, []string{"key", "delete", "--key", ref}, "yes\n"); code == 0 {
+	if code, _, _ := run(t, []string{"key", "delete", "--key", ref, "--force-insecure"}, "yes\n"); code == 0 {
 		t.Fatal("lowercase 'yes' was accepted; caps must be enforced")
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -160,11 +204,58 @@ func TestKeyDeleteConfirmation(t *testing.T) {
 	}
 
 	// Exact "YES" deletes the key.
-	if code, _, errb := run(t, []string{"key", "delete", "--key", ref}, "YES\n"); code != 0 {
+	if code, _, errb := run(t, []string{"key", "delete", "--key", ref, "--force-insecure"}, "YES\n"); code != 0 {
 		t.Fatalf("delete with YES: code=%d stderr=%q", code, errb.String())
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("key still present after YES delete: err=%v", err)
+	}
+}
+
+func TestKeyDeleteRequiresExplicitHeadlessBypass(t *testing.T) {
+	skipIfInteractive(t)
+	ref := "file:" + filepath.Join(t.TempDir(), "key")
+	if code, _, errb := run(t, []string{"keygen", "--key", ref}, ""); code != 0 {
+		t.Fatalf("keygen: %s", errb.String())
+	}
+	code, _, errb := run(t, []string{"key", "delete", "--key", ref}, "YES\n")
+	if code == 0 {
+		t.Fatal("non-interactive key deletion succeeded without --force-insecure")
+	}
+	if !strings.Contains(errb.String(), "--force-insecure") {
+		t.Fatalf("non-interactive deletion rejection is not actionable: %q", errb.String())
+	}
+	if _, err := os.Stat(strings.TrimPrefix(ref, "file:")); err != nil {
+		t.Fatalf("key was removed despite rejected headless deletion: %v", err)
+	}
+}
+
+func TestKeyDeleteSurfacesStdinReadError(t *testing.T) {
+	skipIfInteractive(t)
+	ref := "file:" + filepath.Join(t.TempDir(), "key")
+	if code, _, errb := run(t, []string{"keygen", "--key", ref}, ""); code != 0 {
+		t.Fatalf("keygen: %s", errb.String())
+	}
+
+	sentinel := errors.New("confirmation pipe broke")
+	var out, errb bytes.Buffer
+	code := cmdKeyDelete(
+		[]string{"--key", ref, "--force-insecure"},
+		failingReader{sentinel},
+		&out,
+		&errb,
+	)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if strings.Contains(errb.String(), "aborted") {
+		t.Fatalf("read error misreported as an ordinary abort: %q", errb.String())
+	}
+	if !strings.Contains(errb.String(), "read deletion confirmation") || !strings.Contains(errb.String(), sentinel.Error()) {
+		t.Fatalf("stderr does not surface the read error: %q", errb.String())
+	}
+	if _, err := os.Stat(strings.TrimPrefix(ref, "file:")); err != nil {
+		t.Fatalf("key was removed despite the stdin read failure: %v", err)
 	}
 }
 
@@ -173,6 +264,17 @@ func TestUsageErrors(t *testing.T) {
 		if code, _, _ := run(t, args, ""); code != 2 {
 			t.Errorf("%v: exit = %d, want 2", args, code)
 		}
+	}
+}
+
+func TestRekeyRequiresExplicitHeadlessBypass(t *testing.T) {
+	skipIfInteractive(t)
+	code, _, errb := run(t, []string{"rekey", "--new-key", "file:/does/not/exist"}, "")
+	if code == 0 {
+		t.Fatal("non-interactive rekey succeeded without --force-insecure")
+	}
+	if !strings.Contains(errb.String(), "non-interactive") || !strings.Contains(errb.String(), "--force-insecure") {
+		t.Fatalf("non-interactive rejection is not actionable: %q", errb.String())
 	}
 }
 

@@ -11,8 +11,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/b4ryon/git-remote-cloak/internal/backend"
 	"github.com/b4ryon/git-remote-cloak/internal/cloakerr"
 	"github.com/b4ryon/git-remote-cloak/internal/config"
+	"github.com/b4ryon/git-remote-cloak/internal/keystore"
 	"github.com/b4ryon/git-remote-cloak/internal/manifest"
 )
 
@@ -34,6 +36,55 @@ func TestParseObjectPaths(t *testing.T) {
 	}
 	if got[oidA] != "big.bin" || got[oidB] != "dir name/with spaces.txt" {
 		t.Fatalf("paths mismatch: %v", got)
+	}
+}
+
+func TestEncryptManifestRefusesUnreadableSize(t *testing.T) {
+	man := &manifest.Manifest{
+		Version: manifest.Version,
+		RepoID:  strings.Repeat("a", 32),
+		Refs: map[string]string{
+			"refs/heads/" + strings.Repeat("x", backend.MaxManifestBytes): oidA,
+		},
+	}
+	_, _, err := EncryptManifest(man, keystore.Key{})
+	if kind, ok := cloakerr.KindOf(err); !ok || kind != cloakerr.TooLarge {
+		t.Fatalf("oversized manifest error = %v, want TooLarge", err)
+	}
+}
+
+func TestEncryptManifestAccountsForCiphertextOverhead(t *testing.T) {
+	man := &manifest.Manifest{
+		Version: manifest.Version,
+		RepoID:  strings.Repeat("a", 32),
+		Refs:    map[string]string{"refs/heads/": oidA},
+	}
+	base, err := manifest.Encode(man)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// JSON grows one byte per appended ASCII x. Put the plaintext one byte
+	// under the backend read cap so only age's authenticated framing pushes the
+	// stored ciphertext over it.
+	padding := backend.MaxManifestBytes - len(base) - 1
+	if padding <= 0 {
+		t.Fatalf("test manifest base unexpectedly has %d bytes", len(base))
+	}
+	man.Refs = map[string]string{"refs/heads/" + strings.Repeat("x", padding): oidA}
+	plain, err := manifest.Encode(man)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plain) != backend.MaxManifestBytes-1 {
+		t.Fatalf("plaintext manifest size = %d, want %d", len(plain), backend.MaxManifestBytes-1)
+	}
+
+	_, _, err = EncryptManifest(man, keystore.Key{})
+	if kind, ok := cloakerr.KindOf(err); !ok || kind != cloakerr.TooLarge {
+		t.Fatalf("ciphertext-overhead error = %v, want TooLarge", err)
+	}
+	if !strings.Contains(err.Error(), "ciphertext") {
+		t.Fatalf("ciphertext-overhead error is not specific: %v", err)
 	}
 }
 
@@ -73,6 +124,20 @@ func TestConsolidationWouldExceed(t *testing.T) {
 		if got := e.consolidationWouldExceed(victims); got != c.want {
 			t.Errorf("max=%d: consolidationWouldExceed = %v, want %v", c.max, got, c.want)
 		}
+	}
+}
+
+func TestActualConsolidationWouldExceed(t *testing.T) {
+	e := &Engine{Cfg: config.Config{MaxPackBytes: 100}}
+	if e.actualConsolidationWouldExceed(100) {
+		t.Fatal("exact-limit consolidated pack was rejected")
+	}
+	if !e.actualConsolidationWouldExceed(101) {
+		t.Fatal("post-build guard accepted an over-limit consolidated pack")
+	}
+	e.Cfg.MaxPackBytes = 0
+	if e.actualConsolidationWouldExceed(1 << 40) {
+		t.Fatal("disabled post-build guard rejected a pack")
 	}
 }
 
@@ -168,6 +233,9 @@ func TestCheckPackLimit(t *testing.T) {
 	}
 	if !strings.Contains(msg, "alone exceeds the limit") {
 		t.Fatalf("single-file-over-limit not flagged: %q", msg)
+	}
+	if !strings.Contains(msg, "Do not use Git LFS") || !strings.Contains(msg, "bypass cloak") {
+		t.Fatalf("error does not warn that Git LFS bypasses cloak: %q", msg)
 	}
 }
 

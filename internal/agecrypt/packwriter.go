@@ -7,6 +7,7 @@ package agecrypt
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -14,6 +15,11 @@ import (
 
 	"github.com/b4ryon/git-remote-cloak/internal/keystore"
 )
+
+// ErrCiphertextLimit is returned when a limited PackWriter would write beyond
+// its configured ciphertext cap. Callers use it to switch to bounded pack
+// splitting rather than first materializing an arbitrarily large pack.
+var ErrCiphertextLimit = errors.New("encrypted pack exceeds configured ciphertext limit")
 
 // PackWriter encrypts plaintext written to it into a temp file. After
 // Close, ID/Size/Path describe the finished ciphertext blob.
@@ -23,6 +29,8 @@ type PackWriter struct {
 	hasher hash.Hash
 	size   int64
 	closed bool
+	limit  int64
+	over   bool
 }
 
 // counting wraps the file to count ciphertext bytes.
@@ -31,19 +39,51 @@ type counting struct {
 }
 
 func (c counting) Write(p []byte) (int, error) {
-	n, err := c.pw.f.Write(p)
+	if len(p) == 0 {
+		return 0, nil
+	}
+	write := p
+	over := false
+	if c.pw.limit > 0 {
+		remaining := c.pw.limit - c.pw.size
+		if remaining <= 0 {
+			c.pw.over = len(p) > 0
+			return 0, ErrCiphertextLimit
+		}
+		if int64(len(write)) > remaining {
+			write = write[:remaining]
+			over = true
+		}
+	}
+	n, err := c.pw.f.Write(write)
 	c.pw.hasher.Write(p[:n])
 	c.pw.size += int64(n)
+	if err == nil && n != len(write) {
+		err = io.ErrShortWrite
+	}
+	if err == nil && over {
+		c.pw.over = true
+		err = ErrCiphertextLimit
+	}
 	return n, err
 }
 
 // NewPackWriter creates the temp file in dir and returns the encryptor.
 func NewPackWriter(dir string, master keystore.Key) (*PackWriter, error) {
+	return NewPackWriterLimited(dir, master, 0)
+}
+
+// NewPackWriterLimited creates a PackWriter whose ciphertext file never grows
+// beyond maxBytes. maxBytes == 0 disables the limit.
+func NewPackWriterLimited(dir string, master keystore.Key, maxBytes int64) (*PackWriter, error) {
+	if maxBytes < 0 {
+		return nil, fmt.Errorf("create limited pack writer: negative ciphertext limit %d", maxBytes)
+	}
 	f, err := os.CreateTemp(dir, "enc-*")
 	if err != nil {
 		return nil, fmt.Errorf("create pack encryption scratch file in %q: %w", dir, err)
 	}
-	pw := &PackWriter{f: f, hasher: sha256.New()}
+	pw := &PackWriter{f: f, hasher: sha256.New(), limit: maxBytes}
 	w, err := Encrypt(counting{pw}, master)
 	if err != nil {
 		_ = f.Close()
@@ -78,6 +118,9 @@ func (p *PackWriter) Abort() {
 	_ = p.Close()
 	_ = os.Remove(p.f.Name())
 }
+
+// LimitExceeded reports whether ciphertext output hit the configured cap.
+func (p *PackWriter) LimitExceeded() bool { return p.over }
 
 // ID is the hex SHA-256 of the ciphertext (valid after Close).
 func (p *PackWriter) ID() string { return hex.EncodeToString(p.hasher.Sum(nil)) }

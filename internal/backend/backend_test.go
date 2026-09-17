@@ -4,8 +4,11 @@
 package backend
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -20,6 +23,159 @@ func open(t *testing.T) *Backend {
 		t.Fatal(err)
 	}
 	return b
+}
+
+func TestOpenRejectsCredentialURLWithoutLoggingIt(t *testing.T) {
+	const rawURL = "https://alice-sentinel:password-sentinel@example.invalid/org/repo.git?token=token-sentinel#fragment-sentinel"
+	var logs bytes.Buffer
+	lg := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	g := gitx.New(lg)
+	gitDir := filepath.Join(t.TempDir(), "backend.git")
+	if _, err := Open(g, gitDir, rawURL, "cloak", lg); err == nil {
+		t.Fatal("Open accepted credentials embedded in its transport URL")
+	} else if !strings.Contains(err.Error(), "credential helper") {
+		t.Fatalf("credential rejection is not actionable: %v", err)
+	}
+	if _, err := os.Stat(gitDir); !os.IsNotExist(err) {
+		t.Fatalf("unsafe URL was persisted before rejection: stat error %v", err)
+	}
+	for _, secret := range []string{"alice-sentinel", "password-sentinel", "token-sentinel", "fragment-sentinel"} {
+		if strings.Contains(logs.String(), secret) {
+			t.Fatalf("backend setup log leaked %q: %s", secret, logs.String())
+		}
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("unsafe URL reached git/logging before preflight rejection: %s", logs.String())
+	}
+}
+
+func TestOpenPruneCannotFollowInheritedObjectDirectory(t *testing.T) {
+	lg := slog.New(slog.DiscardHandler)
+	g := gitx.New(lg)
+	source := filepath.Join(t.TempDir(), "source.git")
+	if _, _, err := g.Run(gitx.Opts{Scrub: true}, "init", "--bare", source); err != nil {
+		t.Fatal(err)
+	}
+	oid, err := g.Out(gitx.Opts{GitDir: source, Stdin: strings.NewReader("source sentinel")},
+		"hash-object", "-w", "--stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectPath := filepath.Join(source, "objects", oid[:2], oid[2:])
+	if _, err := os.Stat(objectPath); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GIT_OBJECT_DIRECTORY", filepath.Join(source, "objects"))
+	if _, err := Open(g, filepath.Join(t.TempDir(), "backend.git"), "/nonexistent-host", "cloak", lg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(objectPath); err != nil {
+		t.Fatalf("backend initialization/prune touched redirected source object: %v", err)
+	}
+}
+
+func TestOpenPinsBackendObjectFormatToSHA1(t *testing.T) {
+	global := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(global, []byte("[init]\n\tdefaultObjectFormat = sha256\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	lg := slog.New(slog.DiscardHandler)
+	g := gitx.New(lg)
+	b, err := Open(g, filepath.Join(t.TempDir(), "backend.git"), "/nonexistent-host", "cloak", lg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	format, err := g.Out(gitx.Opts{GitDir: b.gitDir}, "rev-parse", "--show-object-format")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if format != "sha1" {
+		t.Fatalf("backend format = %q, want sha1", format)
+	}
+}
+
+func TestOpenRejectsCredentialBearingPushInsteadOf(t *testing.T) {
+	global := filepath.Join(t.TempDir(), "gitconfig")
+	const secretURL = "https://token-sentinel@example.invalid/"
+	if err := os.WriteFile(global, []byte("[url \""+secretURL+"\"]\n\tpushInsteadOf = gh:\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+	var logs bytes.Buffer
+	lg := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	_, err := Open(gitx.New(lg), filepath.Join(t.TempDir(), "backend.git"), "gh:org/repo.git", "cloak", lg)
+	if err == nil {
+		t.Fatal("Open accepted a credential-bearing pushInsteadOf rewrite")
+	}
+	for _, output := range []string{err.Error(), logs.String()} {
+		if strings.Contains(output, "token-sentinel") {
+			t.Fatalf("pushInsteadOf rejection leaked credential: %q", output)
+		}
+	}
+	if !strings.Contains(err.Error(), "credential helper") {
+		t.Fatalf("pushInsteadOf rejection is not actionable: %v", err)
+	}
+}
+
+func TestOpenRejectsHelperPushInsteadOf(t *testing.T) {
+	global := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(global, []byte("[url \"ext::sh -c false\"]\n\tpushInsteadOf = gh:\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_ALLOW_PROTOCOL", "ext:file:ssh:https")
+
+	lg := slog.New(slog.DiscardHandler)
+	_, err := Open(gitx.New(lg), filepath.Join(t.TempDir(), "backend.git"), "gh:org/repo.git", "cloak", lg)
+	if err == nil || !strings.Contains(err.Error(), "remote-helper transport") {
+		t.Fatalf("Open did not reject helper pushInsteadOf: %v", err)
+	}
+}
+
+func TestOpenRejectsUnknownSchemePushInsteadOf(t *testing.T) {
+	global := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(global, []byte("[url \"evil://example.invalid/\"]\n\tpushInsteadOf = gh:\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_ALLOW_PROTOCOL", "evil:file:ssh:https")
+
+	lg := slog.New(slog.DiscardHandler)
+	_, err := Open(gitx.New(lg), filepath.Join(t.TempDir(), "backend.git"), "gh:org/repo.git", "cloak", lg)
+	if err == nil || !strings.Contains(err.Error(), "external remote helper") {
+		t.Fatalf("Open did not reject unknown-scheme pushInsteadOf: %v", err)
+	}
+}
+
+func TestClassifyProbedPushState(t *testing.T) {
+	tests := []struct {
+		name                string
+		commit, expectedOld string
+		head                string
+		exists              bool
+		want                PushResult
+	}{
+		{"attempt accepted", "new", "old", "new", true, PushOK},
+		{"concurrent update", "new", "old", "other", true, PushCASLost},
+		{"concurrent deletion", "new", "old", "", false, PushCASLost},
+		{"concurrent initial create", "new", "", "other", true, PushCASLost},
+		{"stable existing head", "new", "old", "old", true, PushFailed},
+		{"stable absent head", "new", "", "", false, PushFailed},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyProbedPushState(tc.commit, tc.expectedOld, tc.head, tc.exists); got != tc.want {
+				t.Fatalf("result = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // TestIsMissingPacksTree pins the sentinel detection PackBlobOIDs uses to tell a

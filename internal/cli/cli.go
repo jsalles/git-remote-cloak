@@ -21,9 +21,9 @@ Commands:
   keygen            generate the shared master key
   key export        print the key for transfer/backup (user-presence gated)
   key import        import a key on a second machine
-  key delete        delete a stored key (asks for a YES confirmation)
+  key delete        delete a stored key (user-presence + YES confirmation)
   status            show remote generation, packs, applied state
-  repack            full consolidation of the remote into one pack
+  repack            full consolidation into a bounded encrypted pack set
   rekey             full repack under a new master key (user-presence gated)
   accept-rollback   accept a remote generation regression once (user-presence gated)
   accept-repo-change accept a remote repo-identity change once (user-presence gated)

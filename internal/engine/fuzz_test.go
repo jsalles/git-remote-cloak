@@ -40,14 +40,12 @@
 // the ref) and the no-input-mutation contract preparePush relies on (it hands in
 // the live manifest.Refs map) are pinned without a host.
 // repackManifest is the FullRepack manifest builder fuzzed here: a full repack
-// squashes every live pack into one merged pack, and the next-generation
-// manifest must bump the rollback generation by exactly one, list that single
-// pack, and carry EVERY prior pack id in its Replaces list (so clients that
-// already applied the old packs skip the merged one -- packSkippable), while
-// carrying the repo identity/head/refs/version forward unchanged and not
-// mutating the caller's current manifest. repackOnce never Validates this
-// manifest before persisting man.Generation/man.Packs[0].ID, so the
-// construction contract is self-enforced.
+// replaces every live pack with one or more size-bounded packs. The
+// next-generation manifest must bump the rollback generation by exactly one
+// and carry prior pack ids only when there is one replacement. Split repacks
+// omit that quadratic lineage and require clients to fetch the bounded set.
+// Repo identity/head/refs/version carry forward unchanged and the current
+// manifest is never mutated.
 // nextPushManifest is the NORMAL-push manifest builder fuzzed here, the common
 // counterpart to repackManifest: assembleManifest resolves the random repo id
 // and the git HEAD symref, then delegates the pure construction to it. It bumps
@@ -86,10 +84,10 @@
 // manifest read-side consumer left without a direct fuzz.
 // consolidatedPacks is the geometric-consolidation pack-set builder fuzzed here,
 // lifted out of applyConsolidation. It is the third distinct manifest pack-set
-// construction contract alongside repackManifest (replace ALL packs with one
-// merged pack) and nextPushManifest (append a pack, retain ALL prior): a
-// consolidation drops only the VICTIM subset, retains the non-victim survivors,
-// and appends one merged pack carrying every victim id as Replaces. The
+// construction contract alongside repackManifest (replace ALL packs with a
+// bounded replacement set) and nextPushManifest (append packs, retain ALL
+// prior): a consolidation drops only the VICTIM subset, retains the non-victim
+// survivors, and appends one merged pack carrying every victim id as Replaces. The
 // load-bearing invariant ties to packSkippable: every live pack must end up
 // either retained as a survivor or declared superseded in the merged pack's
 // Replaces, or a client that had not yet applied a dropped pack would never
@@ -124,6 +122,7 @@ import (
 	"testing"
 	"unicode"
 
+	"github.com/b4ryon/git-remote-cloak/internal/cloakerr"
 	"github.com/b4ryon/git-remote-cloak/internal/manifest"
 )
 
@@ -578,30 +577,25 @@ func FuzzPlanRefUpdatesDeletes(f *testing.F) {
 
 // FuzzRepackManifest pins repackManifest, the next-generation manifest builder
 // for a full repack (consolidate.go). It asserts, over an arbitrary current
-// manifest and merged-pack id/size: the generation is bumped by exactly one, the
-// pack set becomes the single merged pack carrying every prior pack id (in
-// order, no drop/dup/reorder) as Replaces, the version/repo-id/head/refs are
-// carried forward unchanged, the produced manifest is isolated from the input
-// (scribbling it never corrupts cur, which repackOnce keeps using on a lost-CAS
-// retry), and the build is deterministic. The Replaces-lists-every-prior-id
-// contract is the load-bearing one: it is what lets a client that already
-// applied the old packs skip re-downloading the merged pack (packSkippable).
+// manifest and replacement pack set, that a single replacement carries every
+// old pack id while split replacements omit the quadratic lineage, all other
+// manifest state is carried forward, and inputs never alias the result.
 func FuzzRepackManifest(f *testing.F) {
 	const (
 		oid40  = "1111111111111111111111111111111111111111"
 		repo32 = "0123456789abcdef0123456789abcdef"
 		id64   = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	)
-	// Seeds: a typical multi-pack repack, an empty old-pack set, a single old
-	// pack, the generation-wraps-to-zero edge, and duplicate old ids with a
-	// negative size (repackManifest copies fields faithfully without validating).
-	f.Add(uint64(5), []byte{0, 1, 2}, "refs/heads/dev", oid40, "refs/heads/main", repo32, id64, int64(4096))
-	f.Add(uint64(0), []byte{}, "", "", "", "", "", int64(0))
-	f.Add(uint64(1), []byte{9}, "refs/tags/v1", oid40, "", repo32, id64, int64(1))
-	f.Add(^uint64(0), []byte{0}, "", "", "", repo32, id64, int64(1<<40))
-	f.Add(uint64(42), []byte{7, 7, 7}, "refs/heads/x", oid40, "refs/heads/x", repo32, id64, int64(-1))
+	// Seeds cover multiple replacements, no replacements, one replacement,
+	// generation wrap, and duplicate old ids. The first replacement retains
+	// arbitrary id/size inputs; extraSeed adds deterministic additional packs.
+	f.Add(uint64(5), []byte{0, 1, 2}, "refs/heads/dev", oid40, "refs/heads/main", repo32, id64, int64(4096), []byte{1, 2})
+	f.Add(uint64(0), []byte{}, "", "", "", "", "", int64(0), []byte{})
+	f.Add(uint64(1), []byte{9}, "refs/tags/v1", oid40, "", repo32, id64, int64(1), []byte{})
+	f.Add(^uint64(0), []byte{0}, "", "", "", repo32, id64, int64(1<<40), []byte{3})
+	f.Add(uint64(42), []byte{7, 7, 7}, "refs/heads/x", oid40, "refs/heads/x", repo32, id64, int64(-1), []byte{4, 5})
 
-	f.Fuzz(func(t *testing.T, gen uint64, packSeed []byte, refName, refOID, head, repoID, newID string, newSize int64) {
+	f.Fuzz(func(t *testing.T, gen uint64, packSeed []byte, refName, refOID, head, repoID, newID string, newSize int64, extraSeed []byte) {
 		// Build cur's manifest: arbitrary carried-over fields plus one old pack
 		// per packSeed byte (id derived from the byte; duplicates allowed, exactly
 		// as a real manifest may carry whatever ids were live).
@@ -630,11 +624,21 @@ func FuzzRepackManifest(f *testing.F) {
 			wantOldIDs = append(wantOldIDs, p.ID)
 		}
 
-		man := repackManifest(cur, newID, newSize)
+		newPacks := repackPlansFrom(newID, newSize, extraSeed)
+		man, err := repackManifest(cur, newPacks)
+		if gen == ^uint64(0) {
+			if kind, ok := cloakerr.KindOf(err); !ok || kind != cloakerr.Protocol {
+				t.Fatalf("generation exhaustion error = %v, want Protocol", err)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("repackManifest: %v", err)
+		}
 
-		// Generation bump, single merged pack carrying every prior id as Replaces,
-		// and carry-over of version/repo-id/head/refs.
-		assertRepackResult(t, man, gen, newID, newSize, wantOldIDs, repoID, head, snapRefs)
+		// Generation bump, exact bounded replacement set with cardinality-aware
+		// Replaces lineage, and carry-over of version/repo-id/head/refs.
+		assertRepackResult(t, man, gen, newPacks, wantOldIDs, repoID, head, snapRefs)
 
 		// Isolation: scribbling the result must not corrupt cur's manifest
 		// (repackOnce keeps using cur on a lost-CAS retry).
@@ -642,20 +646,42 @@ func FuzzRepackManifest(f *testing.F) {
 		man.RepoID = "MUTATED"
 		man.Head = "MUTATED"
 		man.Refs["refs/heads/injected"] = "x"
-		man.Packs[0].ID = "MUTATED"
-		if len(man.Packs[0].Replaces) > 0 {
-			man.Packs[0].Replaces[0] = "MUTATED"
+		if len(man.Packs) > 0 {
+			man.Packs[0].ID = "MUTATED"
+			if len(man.Packs[0].Replaces) > 0 {
+				man.Packs[0].Replaces[0] = "MUTATED"
+				if len(man.Packs) > 1 && man.Packs[1].Replaces[0] == "MUTATED" {
+					t.Fatal("repackManifest aliased sibling Replaces slices")
+				}
+			}
 		}
 		assertCurUnmutated(t, cur, gen, repoID, head, snapRefs, wantOldIDs)
 
 		// Determinism: cur is now verified clean, so a re-build reproduces it.
-		man2 := repackManifest(cur, newID, newSize)
-		if man2.Generation != gen+1 || len(man2.Packs) != 1 ||
-			man2.Packs[0].ID != newID || man2.Packs[0].Size != newSize ||
-			!slices.Equal(man2.Packs[0].Replaces, wantOldIDs) {
-			t.Fatalf("repackManifest not deterministic")
+		man2, err := repackManifest(cur, newPacks)
+		if err != nil {
+			t.Fatalf("second repackManifest: %v", err)
 		}
+		assertRepackResult(t, man2, gen, newPacks, wantOldIDs, repoID, head, snapRefs)
 	})
+}
+
+// repackPlansFrom turns fuzz inputs into a bounded replacement set. newID==""
+// omits the arbitrary first pack; extraSeed adds up to seven uniquely identified
+// packs so multi-pack shape and Replaces-slice isolation are exercised without
+// allowing unbounded allocation from a fuzz input.
+func repackPlansFrom(newID string, newSize int64, extraSeed []byte) []plannedPack {
+	packs := planPacksFrom(newID, newSize)
+	if len(extraSeed) > 7 {
+		extraSeed = extraSeed[:7]
+	}
+	for i, b := range extraSeed {
+		packs = append(packs, plannedPack{
+			id:   fmt.Sprintf("%064x", 0x100+i*0x100+int(b)),
+			size: int64(b),
+		})
+	}
+	return packs
 }
 
 // planPacksFrom builds the plannedPack slice for the fuzzers from a single
@@ -729,7 +755,16 @@ func FuzzNextPushManifest(f *testing.F) {
 		}
 		wantNewRefs := maps.Clone(newRefs)
 
-		man := nextPushManifest(base, newRefs, head, planPacksFrom(newID, newSize))
+		man, err := nextPushManifest(base, newRefs, head, planPacksFrom(newID, newSize))
+		if gen == ^uint64(0) {
+			if kind, ok := cloakerr.KindOf(err); !ok || kind != cloakerr.Protocol {
+				t.Fatalf("generation exhaustion error = %v, want Protocol", err)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("nextPushManifest: %v", err)
+		}
 
 		// Generation bump, wholesale install of the published ref set/head, and
 		// carry-over of version/repo identity.
@@ -753,7 +788,10 @@ func FuzzNextPushManifest(f *testing.F) {
 		// (a fresh newRefs clone, since the scribble above mutated the aliased one).
 		// The scribble left man.Packs's length intact, so it stands in for the
 		// expected pack count.
-		man2 := nextPushManifest(base, maps.Clone(wantNewRefs), head, planPacksFrom(newID, newSize))
+		man2, err := nextPushManifest(base, maps.Clone(wantNewRefs), head, planPacksFrom(newID, newSize))
+		if err != nil {
+			t.Fatalf("second nextPushManifest: %v", err)
+		}
 		if man2.Generation != gen+1 || man2.Head != head || man2.RepoID != repoID ||
 			!maps.Equal(man2.Refs, wantNewRefs) || len(man2.Packs) != len(man.Packs) {
 			t.Fatalf("nextPushManifest not deterministic")
@@ -1367,24 +1405,30 @@ func assertBaseUnmutated(t *testing.T, base *manifest.Manifest, gen uint64, repo
 	}
 }
 
-// assertRepackResult pins repackManifest's construction contract: the generation
-// is bumped by exactly one, the pack set is the single merged pack (id/size
-// verbatim) carrying every prior pack id in order as Replaces, and
-// version/repo-id/head/refs carry forward unchanged.
-func assertRepackResult(t *testing.T, man *manifest.Manifest, gen uint64, newID string, newSize int64, wantOldIDs []string, repoID, head string, snapRefs map[string]string) {
+// assertRepackResult pins repackManifest's construction contract: generation is
+// bumped by exactly one, replacement ids/sizes are copied verbatim, a single
+// replacement carries all prior pack ids while split replacements omit that
+// quadratic lineage, and manifest metadata/refs carry forward unchanged.
+func assertRepackResult(t *testing.T, man *manifest.Manifest, gen uint64, newPacks []plannedPack, wantOldIDs []string, repoID, head string, snapRefs map[string]string) {
 	t.Helper()
 	if man.Generation != gen+1 {
 		t.Fatalf("generation = %d, want %d", man.Generation, gen+1)
 	}
-	if len(man.Packs) != 1 {
-		t.Fatalf("got %d packs, want exactly 1", len(man.Packs))
+	if len(man.Packs) != len(newPacks) {
+		t.Fatalf("got %d packs, want %d", len(man.Packs), len(newPacks))
 	}
-	if man.Packs[0].ID != newID || man.Packs[0].Size != newSize {
-		t.Fatalf("merged pack = {%q, %d}, want {%q, %d}",
-			man.Packs[0].ID, man.Packs[0].Size, newID, newSize)
-	}
-	if !slices.Equal(man.Packs[0].Replaces, wantOldIDs) {
-		t.Fatalf("Replaces = %v, want %v", man.Packs[0].Replaces, wantOldIDs)
+	for i, p := range man.Packs {
+		if p.ID != newPacks[i].id || p.Size != newPacks[i].size {
+			t.Fatalf("replacement pack %d = {%q, %d}, want {%q, %d}",
+				i, p.ID, p.Size, newPacks[i].id, newPacks[i].size)
+		}
+		wantReplaces := []string(nil)
+		if len(newPacks) == 1 {
+			wantReplaces = wantOldIDs
+		}
+		if !slices.Equal(p.Replaces, wantReplaces) {
+			t.Fatalf("replacement pack %d Replaces = %v, want %v", i, p.Replaces, wantReplaces)
+		}
 	}
 	if man.Version != manifest.Version {
 		t.Fatalf("version = %d, want %d", man.Version, manifest.Version)

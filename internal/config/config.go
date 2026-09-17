@@ -24,8 +24,10 @@ type Config struct {
 	// LogLevel is the per-repo file log level (CLOAK_LOG env overrides).
 	LogLevel string
 	// MaxPackBytes is the largest encrypted pack (one host file) cloak will
-	// publish; a build that would exceed it is refused before upload. 0 disables
-	// the check. Defaults to GitHub's per-file hard cap (100 MiB).
+	// publish or accept; an over-limit pack is refused before upload and before
+	// extraction/application. Git may already have transferred the outer blob
+	// into the private backend mirror before this check. 0 disables the check.
+	// Defaults to GitHub's per-file hard cap (100 MiB).
 	MaxPackBytes int64
 }
 

@@ -20,7 +20,7 @@ this repo, also follow `AGENTS.md`, which carries agent-specific rules.
 
 ## Prerequisites
 
-- Go 1.26+ and git.
+- Go 1.26.6 or newer and git.
 - macOS: Xcode command line tools (`xcode-select --install`) for the cgo
   Keychain/Touch ID key backend. Linux builds are pure Go and use a key file.
 
@@ -29,8 +29,9 @@ this repo, also follow `AGENTS.md`, which carries agent-specific rules.
 - `make build` builds `bin/git-remote-cloak` and the `git-cloak` symlink.
 - `make fmt` and `make vet` must be clean.
 
-Do not pass a hand-written version to `go build`/`go install`; the version is
-injected from the latest git tag via `-ldflags`.
+Do not pass a hand-written version to `go build`/`go install`; `make` derives a
+source identity with `git describe --tags --always --dirty` and injects it via
+`-ldflags`.
 
 ## Test
 

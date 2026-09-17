@@ -7,13 +7,13 @@ TMPDIR := $(HOME)/tmp
 export TMPDIR
 
 PREFIX ?= $(HOME)/bin
-# Default to the latest release tag reachable from the current checkout
-# (e.g. v0.1.5) -- only the clean version string, no commit/sha/-dirty suffix.
-# Override explicitly with `make install VERSION=v0.1.5`. Falls back to
-# "unknown" only when no tag is reachable (e.g. outside a git checkout).
-# Never defaults to "dev".
-VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo unknown)
-LDFLAGS := -X github.com/b4ryon/git-remote-cloak/internal/version.Version=$(VERSION)
+# Stamp an exact source identity: a release tag when HEAD is tagged, otherwise
+# the nearest tag plus commit/dirtiness, or the commit id when no tags exist.
+# Unsafe tag characters are mapped to underscores before the value is embedded
+# in a shell recipe/ldflags. Outside a Git checkout leave VERSION empty so
+# internal/version falls back to Go build information.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | LC_ALL=C sed 's/[^A-Za-z0-9._+-]/_/g')
+LDFLAGS := $(if $(VERSION),-X github.com/b4ryon/git-remote-cloak/internal/version.Version=$(VERSION),)
 DIST := dist
 
 .PHONY: build release install check-go test test-integration test-race test-darwin test-e2e vet vuln lint check fmt sign clean
@@ -30,7 +30,7 @@ build:
 	ln -sf git-remote-cloak $(BIN)/git-cloak
 
 # Release binaries: signed darwin/arm64 (cgo Keychain) and a static
-# Linux/amd64 (pure Go, file keystore). Run with VERSION=v0.1.0.
+# Linux/amd64 (pure Go, file keystore). Run from the audited release tag.
 release:
 	mkdir -p $(DIST)
 	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(DIST)/git-remote-cloak-darwin-arm64 ./cmd/git-remote-cloak

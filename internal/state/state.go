@@ -19,6 +19,7 @@ import (
 
 	"github.com/b4ryon/git-remote-cloak/internal/cloakerr"
 	"github.com/b4ryon/git-remote-cloak/internal/manifest"
+	"github.com/b4ryon/git-remote-cloak/internal/urlredact"
 )
 
 // isSafeName reports whether s is a non-empty string of only [A-Za-z0-9._-],
@@ -73,7 +74,7 @@ func (d *Dir) acceptCmd(sub string) string {
 	if d.Selector == "" {
 		return "git cloak " + sub
 	}
-	return "git cloak " + sub + " " + d.Selector
+	return "git cloak " + sub + " " + urlredact.Text(d.Selector)
 }
 
 // Open resolves (and creates) the state directory for the remote under the
@@ -153,6 +154,30 @@ func (d *Dir) BackendGitDir() string { return filepath.Join(d.Root, "backend.git
 // TmpDir is scratch space inside the state directory (same filesystem as
 // the local repo, plaintext allowed: the local repo is plaintext anyway).
 func (d *Dir) TmpDir() string { return filepath.Join(d.Root, "tmp") }
+
+// CleanTmp removes every transient artifact left by an interrupted prior
+// invocation. Callers hold the per-remote lock, so no live operation can own a
+// file here. This includes decrypted pack files and split/consolidation scratch
+// repositories; a cleanup failure is surfaced rather than silently retaining
+// plaintext.
+func (d *Dir) CleanTmp() error {
+	entries, err := os.ReadDir(d.TmpDir())
+	if err != nil {
+		return fmt.Errorf("read cloak scratch directory: %w", err)
+	}
+	for _, entry := range entries {
+		path := filepath.Join(d.TmpDir(), entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove stale cloak scratch path %q: %w", path, err)
+		}
+	}
+	if len(entries) > 0 {
+		if err := syncDir(d.TmpDir()); err != nil {
+			return fmt.Errorf("sync cloak scratch directory after cleanup: %w", err)
+		}
+	}
+	return nil
+}
 
 // LogPath is the per-remote debug log file.
 func (d *Dir) LogPath() string { return filepath.Join(d.Root, "log") }

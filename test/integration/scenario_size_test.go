@@ -6,6 +6,8 @@
 package integration
 
 import (
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -63,6 +65,40 @@ func TestSizeLimitRefusesOversizedPush(t *testing.T) {
 	a.MustGit("push", "-u", "origin", "main")
 	if refs := host.Git("for-each-ref", "--format=%(refname)"); !strings.Contains(refs, "refs/heads/cloak") {
 		t.Fatalf("recovery push did not create the cloak branch: %q", refs)
+	}
+}
+
+func TestDebugSeederRefusesOversizedPack(t *testing.T) {
+	host := harness.NewHost(t)
+	key := harness.NewKeyFile(t)
+	src := harness.NewClient(t, "seed-size", key)
+	src.InitRepo()
+	src.WriteFile("large.bin", incompressible(200_000))
+	src.Commit("large seed")
+
+	_, stderr, err := src.Cloak("debug", "seed-remote",
+		"--from", src.Dir,
+		"--key", "file:"+key,
+		"--max-pack-bytes", "50000",
+		host.Dir)
+	if err == nil {
+		t.Fatal("debug seeder published an over-limit pack")
+	}
+	if !strings.Contains(stderr, "too large for host") || !strings.Contains(stderr, "seed") {
+		t.Fatalf("debug seeder size error is not actionable: %s", stderr)
+	}
+	if refs := host.Git("for-each-ref", "--format=%(refname)"); refs != "" {
+		t.Fatalf("rejected seed changed the carrier: %s", refs)
+	}
+	// The source repository must not retain the seeder's encrypted scratch dir.
+	matches, globErr := filepath.Glob(filepath.Join(src.Dir, ".git", "cloak-seed-*"))
+	if globErr != nil {
+		t.Fatal(globErr)
+	}
+	for _, match := range matches {
+		if _, statErr := os.Stat(match); statErr == nil {
+			t.Fatalf("rejected seed left scratch directory %s", match)
+		}
 	}
 }
 
@@ -125,6 +161,85 @@ func TestMultiPackPushRoundTrips(t *testing.T) {
 	b.MustClone(host.Dir)
 	if b.HeadOID() != a.HeadOID() {
 		t.Fatalf("multi-pack clone HEAD %s != source %s", b.HeadOID(), a.HeadOID())
+	}
+}
+
+// TestMultiPackRepackAndRekeyRoundTrips proves both full-maintenance paths use
+// the push splitter instead of failing when total reachable history exceeds the
+// host's per-file limit. It also verifies that split replacements omit
+// quadratic Replaces lineage and that every rekeyed pack is readable by a
+// fresh new-key client.
+func TestMultiPackRepackAndRekeyRoundTrips(t *testing.T) {
+	host := harness.NewHost(t)
+	oldKey := harness.NewKeyFile(t)
+	a := harness.NewClient(t, "a", oldKey)
+	a.InitRepo()
+	const limit = 2 << 20
+	a.MustGit("config", "cloak.maxPackBytes", strconv.Itoa(limit))
+	a.MustGit("config", "cloak.geometricFactor", "0")
+	for i, name := range []string{"a.bin", "b.bin", "c.bin", "d.bin"} {
+		a.WriteFile(name, incompressibleSeed(uint32(i+1)*2654435761, 1<<20))
+	}
+	a.Commit("large history")
+	a.AddOrigin(host.Dir)
+	a.MustGit("push", "-u", "origin", "main")
+
+	// This client has every pre-repack pack applied. Split full repacks omit
+	// Replaces to keep manifest growth linear, so after a small follow-up gives
+	// Git a new object to request it downloads the full bounded replacement set.
+	b := harness.NewClient(t, "b", oldKey)
+	b.MustClone(host.Dir)
+	beforeApplied := strings.Count(b.DebugLog(), `"msg":"applied pack"`)
+
+	out := a.MustCloak("repack", "--remote", "origin")
+	if !strings.Contains(out, " packs totaling ") {
+		t.Fatalf("multi-pack repack output does not report count and total: %q", out)
+	}
+	assertHostPacksWithinLimit(t, host, limit)
+	repackPackCount := len(hostPackSizes(t, host))
+	if got := host.Git("rev-list", "--count", "cloak"); got != "1" {
+		t.Fatalf("multi-pack repack did not squash backend chain: %s commits", got)
+	}
+
+	a.WriteFile("after-repack.md", "forces a fetch after replacement\n")
+	a.Commit("after split repack")
+	a.MustGit("push", "origin", "main")
+	b.MustGit("pull", "origin", "main")
+	afterApplied := strings.Count(b.DebugLog(), `"msg":"applied pack"`)
+	if want := beforeApplied + repackPackCount + 1; afterApplied != want {
+		t.Fatalf("client applied %d packs after split repack, want %d replacement + follow-up packs",
+			afterApplied-beforeApplied, repackPackCount+1)
+	}
+
+	newKey := filepath.Join(t.TempDir(), "new.key")
+	a.MustCloak("keygen", "--key", "file:"+newKey)
+	out = a.MustCloak("rekey", "--remote", "origin", "--new-key", "file:"+newKey, "--force-insecure")
+	if !strings.Contains(out, " packs totaling ") {
+		t.Fatalf("multi-pack rekey output does not report count and total: %q", out)
+	}
+	assertHostPacksWithinLimit(t, host, limit)
+
+	_, stderr, err := b.Git("pull", "origin", "main")
+	if err == nil || !strings.Contains(stderr, "TAMPER ALARM") {
+		t.Fatalf("old key did not fail closed after multi-pack rekey: err=%v stderr=%s", err, stderr)
+	}
+	c := harness.NewClient(t, "c", newKey)
+	c.MustClone(host.Dir)
+	if c.HeadOID() != a.HeadOID() {
+		t.Fatalf("new-key clone did not reconstruct multi-pack rekey: %s != %s", c.HeadOID(), a.HeadOID())
+	}
+}
+
+func assertHostPacksWithinLimit(t *testing.T, host *harness.Host, limit int64) {
+	t.Helper()
+	sizes := hostPackSizes(t, host)
+	if len(sizes) < 2 {
+		t.Fatalf("full repack produced %d pack(s), want at least 2 (sizes %v)", len(sizes), sizes)
+	}
+	for _, size := range sizes {
+		if size > limit {
+			t.Fatalf("full repack produced an over-limit pack: %d > %d (all %v)", size, limit, sizes)
+		}
 	}
 }
 

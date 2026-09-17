@@ -14,12 +14,20 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/b4ryon/git-remote-cloak/internal/urlredact"
 )
 
 // defaultGitTimeout bounds a git invocation when no context is supplied and
 // the call is not interactive, so a dead or stalled host cannot hang the
 // helper (and the user's git) indefinitely.
 const defaultGitTimeout = 120 * time.Second
+
+// allowedGitProtocols is the complete transport set cloak permits its child
+// Git processes to use. GIT_ALLOW_PROTOCOL is an absolute whitelist, so it
+// also blocks arbitrary git-remote-<scheme> helpers for unknown scheme:// URLs
+// as defense in depth behind setup's URL allowlist.
+const allowedGitProtocols = "file:git:http:https:ssh"
 
 // defaultTimeout resolves the per-invocation deadline. CLOAK_GIT_TIMEOUT
 // overrides it with a Go duration (e.g. "30s", "5m"); "0" or "off" disables
@@ -94,6 +102,16 @@ type Opts struct {
 	// user's own repo data and may legitimately be large. A caller streaming via
 	// Stdout is unaffected (that path is never buffered).
 	MaxCapture int64
+	// SensitiveArgs prevents command arguments from reaching debug logs or
+	// returned errors. The real argv is still passed to git. Use this for
+	// credential-bearing values such as a configured remote URL.
+	SensitiveArgs bool
+	// SensitiveURLs removes credentials, query parameters, and fragments from
+	// captured stderr before it can reach a returned error or diagnostic log.
+	// Stdout remains raw because many plumbing commands return URLs as data which
+	// callers must validate before deciding whether and how to display them.
+	// The original values are passed to git unchanged.
+	SensitiveURLs []string
 }
 
 // GitError is a non-zero git exit with its captured stderr.
@@ -143,24 +161,23 @@ func resolveContext(o Opts) (context.Context, context.CancelFunc) {
 	return context.Background(), func() {}
 }
 
-// buildEnv assembles the child process environment: the parent environment
-// with any inherited GIT_DIR dropped, then GIT_DIR/scrub/extra pairs applied
-// per o.
+// buildEnv assembles the child process environment: inherited GIT_DIR and
+// GIT_ALLOW_PROTOCOL entries are dropped, then GIT_DIR/scrub/extra pairs and
+// cloak's fixed transport whitelist are applied per o.
 func buildEnv(o Opts) []string {
 	return applyGitEnv(os.Environ(), o)
 }
 
 // applyGitEnv builds the child git environment from a parent environment and
 // the invocation options. It drops every inherited GIT_DIR= entry (so a stray
-// GIT_DIR in cloak's own environment can never silently redirect the git
-// subprocess to the wrong object store), then sets GIT_DIR from o.GitDir when
-// non-empty, appends the config-scrubbing pair when o.Scrub, and appends o.Env
-// verbatim. Pure (the os.Environ() read stays in buildEnv) so the GIT_DIR
-// isolation contract is fuzz-reachable without touching the process environment.
+// GIT_DIR cannot redirect the subprocess) and every GIT_ALLOW_PROTOCOL= entry
+// (so the caller cannot re-enable an external helper), applies the requested
+// local options, then installs cloak's fixed transport whitelist last. Pure so
+// the isolation contract is fuzz-reachable without touching process state.
 func applyGitEnv(parent []string, o Opts) []string {
-	env := make([]string, 0, len(parent)+4)
+	env := make([]string, 0, len(parent)+len(o.Env)+5)
 	for _, kv := range parent {
-		if strings.HasPrefix(kv, "GIT_DIR=") {
+		if isRepositoryRedirectEnv(kv) || strings.HasPrefix(kv, "GIT_ALLOW_PROTOCOL=") {
 			continue
 		}
 		env = append(env, kv)
@@ -171,7 +188,30 @@ func applyGitEnv(parent []string, o Opts) []string {
 	if o.Scrub {
 		env = append(env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
 	}
-	return append(env, o.Env...)
+	for _, kv := range o.Env {
+		if isRepositoryRedirectEnv(kv) || strings.HasPrefix(kv, "GIT_ALLOW_PROTOCOL=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env, "GIT_ALLOW_PROTOCOL="+allowedGitProtocols)
+}
+
+// isRepositoryRedirectEnv identifies Git environment variables that can point
+// a command at object, ref, index, worktree, shallow, graft, or replacement
+// state outside the explicit Opts.GitDir. Inheriting any of them would let a
+// backend maintenance command (notably prune) mutate the source repository.
+func isRepositoryRedirectEnv(kv string) bool {
+	key, _, _ := strings.Cut(kv, "=")
+	switch key {
+	case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_INDEX_FILE", "GIT_INDEX_VERSION",
+		"GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE", "GIT_GRAFT_FILE", "GIT_NAMESPACE",
+		"GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_INTERNAL_SUPER_PREFIX", "GIT_QUARANTINE_PATH":
+		return true
+	default:
+		return false
+	}
 }
 
 // classifyExit maps a finished invocation to its typed error (nil on success).
@@ -198,9 +238,9 @@ func classifyExit(args []string, ctxErr, runErr error, exit int, dur time.Durati
 func (g *G) Run(o Opts, args ...string) (stdout, stderr string, err error) {
 	ctx, cancel := resolveContext(o)
 	defer cancel()
-	// Refuse git's arbitrary-command transports (ext::, fd::) on every git
-	// invocation as defense in depth behind setup's URL validation, so a
-	// malicious cloak:: URL cannot reach them. Harmless for local plumbing.
+	// Refuse git's arbitrary-command transports (ext::, fd::) explicitly on
+	// every invocation as defense in depth behind both setup's URL validation
+	// and the GIT_ALLOW_PROTOCOL whitelist. Harmless for local plumbing.
 	gitArgs := append([]string{
 		"-c", "protocol.ext.allow=never",
 		"-c", "protocol.fd.allow=never",
@@ -229,9 +269,20 @@ func (g *G) Run(o Opts, args ...string) (stdout, stderr string, err error) {
 
 	stdout = outBuf.String()
 	stderr = errBuf.String()
+	for _, rawURL := range o.SensitiveURLs {
+		stderr = urlredact.KnownURL(stderr, rawURL)
+	}
+	displayArgs := args
+	if o.SensitiveArgs {
+		if len(args) > 0 {
+			displayArgs = []string{args[0], "[redacted arguments]"}
+		} else {
+			displayArgs = []string{"[redacted arguments]"}
+		}
+	}
 	if g.log != nil && (overflowed(outCap) || overflowed(errCap)) {
 		g.log.Warn("git output exceeded capture cap; truncated for classification",
-			"args", strings.Join(args, " "), "cap_bytes", o.MaxCapture,
+			"args", strings.Join(displayArgs, " "), "cap_bytes", o.MaxCapture,
 			"stdout_capped", overflowed(outCap), "stderr_capped", overflowed(errCap))
 	}
 	exit := 0
@@ -243,11 +294,11 @@ func (g *G) Run(o Opts, args ...string) (stdout, stderr string, err error) {
 		}
 	}
 	if g.log != nil {
-		g.log.Debug("git", "args", strings.Join(args, " "), "dir", o.Dir,
+		g.log.Debug("git", "args", strings.Join(displayArgs, " "), "dir", o.Dir,
 			"gitdir", o.GitDir, "exit", exit, "ms", dur.Milliseconds(),
 			"stderr_bytes", len(stderr))
 	}
-	return stdout, stderr, classifyExit(args, ctx.Err(), runErr, exit, dur, stderr)
+	return stdout, stderr, classifyExit(displayArgs, ctx.Err(), runErr, exit, dur, stderr)
 }
 
 // Out runs git and returns whitespace-trimmed stdout.

@@ -46,12 +46,20 @@ func (e *Engine) checkPackLimit(op string, size int64, wants, haves []string) er
 
 // consolidationWouldExceed reports whether merging victims into one pack would
 // exceed cloak.maxPackBytes, predicted from the manifest's recorded ciphertext
-// sizes (no download or packing). The merged pack is at most the sum of the
-// victim sizes (re-delta can only shrink it), so this never under-predicts a
-// genuine overflow; it errs toward skipping a consolidation that might have just
-// fit, which is the safe direction (skipping only leaves more, smaller packs).
+// sizes (no download or packing). Different Git compression/delta settings can
+// make the rebuilt pack larger than this estimate, so consolidate also checks
+// its actual ciphertext size after building. This cheap precheck avoids work in
+// the ordinary obviously-over-limit case.
 func (e *Engine) consolidationWouldExceed(victims []manifest.Pack) bool {
 	return e.Cfg.MaxPackBytes > 0 && sumPackSizes(victims) > e.Cfg.MaxPackBytes
+}
+
+// actualConsolidationWouldExceed is the authoritative post-build guard. The
+// estimate above is only an optimization because repacking under different Git
+// settings may expand; this check decides whether the produced ciphertext can
+// be published.
+func (e *Engine) actualConsolidationWouldExceed(size int64) bool {
+	return e.Cfg.MaxPackBytes > 0 && size > e.Cfg.MaxPackBytes
 }
 
 // sumPackSizes totals the ciphertext sizes of packs. Sizes are non-negative and
@@ -86,22 +94,23 @@ func splitBudget(limit int64) int64 {
 	return budget
 }
 
-// pushFileTooLargeErr builds the push-path TooLarge error for a single file
-// whose encrypted pack (encSize) exceeds the host's per-file limit -- the one
-// case bin-packing cannot fix, because git cannot split a single object across
-// packs. file names the offending path ("" when git enumeration failed). The
-// wording is written end-to-end here (via cloakerr.Newmsg) so it stays short and
-// actionable; it keeps the TooLarge Kind for classification.
-func pushFileTooLargeErr(encSize, limit int64, file string) error {
+// packFileTooLargeErr builds the TooLarge error for a single file whose
+// encrypted pack (encSize) exceeds the host's per-file limit -- the one case
+// bin-packing cannot fix, because git cannot split a single object across packs.
+// operation identifies the blocked command (push/repack/rekey), and file names
+// the offending path ("" when git enumeration failed). The wording is written
+// end-to-end here so it stays short and actionable while retaining TooLarge.
+func packFileTooLargeErr(operation string, encSize, limit int64, file string) error {
 	if file == "" {
 		file = "(one file)"
 	}
-	msg := fmt.Sprintf("cloak: push blocked - one file exceeds the host's per-file limit.\n"+
+	msg := fmt.Sprintf("cloak: %s blocked - one file exceeds the host's per-file limit.\n"+
 		"  %s   %s encrypted  (limit %s)\n"+
 		"  The host keeps each pack as one file (GitHub caps files at 100 MiB).\n"+
-		"  Fix: remove it, move it to git-lfs, or raise\n"+
-		"       cloak.maxPackBytes  (git config cloak.maxPackBytes <bytes>; 0 = off)",
-		file, humanBytes(encSize), humanBytes(limit))
+		"  Fix: remove it from the history being pushed, split the repository, or raise\n"+
+		"       cloak.maxPackBytes  (git config cloak.maxPackBytes <bytes>; 0 = off).\n"+
+		"  Do not use Git LFS: its objects bypass cloak's encrypted remote.",
+		operation, file, humanBytes(encSize), humanBytes(limit))
 	return cloakerr.Newmsg(cloakerr.TooLarge, msg)
 }
 
@@ -246,11 +255,11 @@ func packTooLargeHint(biggest []objInfo, limit int64) string {
 			fmt.Fprintf(&b, "\n    - %s (%s)", o.path, humanBytes(o.size))
 		}
 		if biggest[0].size > limit {
-			fmt.Fprintf(&b, "\n  %q alone exceeds the limit and cannot be stored as a single pack; remove it or use git-lfs on the host", biggest[0].path)
+			fmt.Fprintf(&b, "\n  %q alone exceeds the limit and cannot be stored as a single pack; remove it from the history being pushed or split the repository", biggest[0].path)
 		}
 		b.WriteString("\n  ")
 	}
-	b.WriteString("shrink or remove the large file(s) and re-commit, or raise `git config cloak.maxPackBytes <bytes>` (set 0 to disable this check)")
+	b.WriteString("shrink or remove the large file(s) from reachable history, or raise `git config cloak.maxPackBytes <bytes>` (set 0 to disable this check). Do not use Git LFS: its objects bypass cloak's encrypted remote")
 	return b.String()
 }
 

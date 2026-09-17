@@ -110,8 +110,8 @@ func TestScenarioPushurlRollbackIsolated(t *testing.T) {
 		t.Fatalf("alarm does not print the --url selector for the wiped backend:\n%s", stderr)
 	}
 
-	// accept-rollback for that URL only (non-interactive: presence skipped).
-	out, errb, err := a.Cloak("accept-rollback", "--remote", "origin", "--url", "cloak::"+hostB.Dir)
+	// accept-rollback for that URL only (explicit headless-test bypass).
+	out, errb, err := a.Cloak("accept-rollback", "--remote", "origin", "--url", "cloak::"+hostB.Dir, "--force-insecure")
 	if err != nil {
 		t.Fatalf("accept-rollback --url failed: %v\n%s", err, errb)
 	}

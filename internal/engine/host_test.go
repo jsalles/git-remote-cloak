@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/b4ryon/git-remote-cloak/internal/backend"
@@ -16,6 +17,7 @@ import (
 	"github.com/b4ryon/git-remote-cloak/internal/config"
 	"github.com/b4ryon/git-remote-cloak/internal/gitx"
 	"github.com/b4ryon/git-remote-cloak/internal/keystore"
+	"github.com/b4ryon/git-remote-cloak/internal/manifest"
 	"github.com/b4ryon/git-remote-cloak/internal/state"
 )
 
@@ -108,6 +110,87 @@ func (m *machine) push(t *testing.T, rs *RemoteState, updates ...RefUpdate) ([]R
 }
 
 const mainRef = "refs/heads/main"
+
+func TestValidateRetryAdvance(t *testing.T) {
+	state := func(repo string, generation uint64, hash string) *RemoteState {
+		return &RemoteState{Manifest: &manifest.Manifest{RepoID: repo, Generation: generation}, ManifestHash: hash}
+	}
+	const repoA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const repoB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	tests := []struct {
+		name     string
+		previous *RemoteState
+		next     *RemoteState
+		wantOK   bool
+		wantKind cloakerr.Kind
+	}{
+		{"first writer adopts winner", &RemoteState{}, state(repoA, 1, "h1"), true, 0},
+		{"same repo advances", state(repoA, 4, "h4"), state(repoA, 5, "h5"), true, 0},
+		{"empty stays empty", &RemoteState{}, &RemoteState{}, false, cloakerr.Rollback},
+		{"observed repo disappears", state(repoA, 4, "h4"), &RemoteState{}, false, cloakerr.Rollback},
+		{"identity switches", state(repoA, 4, "h4"), state(repoB, 5, "h5"), false, cloakerr.Tamper},
+		{"generation regresses", state(repoA, 4, "h4"), state(repoA, 3, "h3"), false, cloakerr.Rollback},
+		{"same generation replay", state(repoA, 4, "h4"), state(repoA, 4, "h4"), false, cloakerr.Rollback},
+		{"same generation changes", state(repoA, 4, "h4"), state(repoA, 4, "fork"), false, cloakerr.Tamper},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateRetryAdvance("push", tc.previous, tc.next)
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if kind, ok := cloakerr.KindOf(err); !ok || kind != tc.wantKind {
+				t.Fatalf("error = %v (kind %v), want kind %v", err, kind, tc.wantKind)
+			}
+		})
+	}
+}
+
+func TestNextManifestGenerationRejectsExhaustion(t *testing.T) {
+	if got, err := nextManifestGeneration("push", 41); err != nil || got != 42 {
+		t.Fatalf("ordinary increment = %d, %v; want 42, nil", got, err)
+	}
+	if got, err := nextManifestGeneration("push", ^uint64(0)); err == nil || got != 0 {
+		t.Fatalf("exhausted increment = %d, %v; want 0, error", got, err)
+	} else if kind, ok := cloakerr.KindOf(err); !ok || kind != cloakerr.Protocol {
+		t.Fatalf("exhaustion kind = %v, want Protocol (err: %v)", kind, err)
+	}
+}
+
+func TestAcceptRepackReturnsCommittedStateOnPersistenceFailure(t *testing.T) {
+	st, err := state.Open(t.TempDir(), "origin", "/unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Make the generation destination a directory so SavePins fails after the
+	// carrier-acceptance point represented by acceptRepack.
+	if err := os.Mkdir(filepath.Join(st.Root, "generation"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	man := &manifest.Manifest{
+		Version:    manifest.Version,
+		RepoID:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Generation: 2,
+		Refs:       map[string]string{},
+		Packs:      []manifest.Pack{},
+	}
+	eng := &Engine{St: st, Log: discard()}
+	committed := builtCommit{commit: oidA, manifestHash: strings.Repeat("b", 64)}
+	attempt, err := eng.acceptRepack(man, committed, nil, true)
+	if err == nil {
+		t.Fatal("acceptRepack unexpectedly persisted into a directory destination")
+	}
+	if attempt.state == nil || attempt.state.Head != committed.commit ||
+		attempt.state.Manifest != man || attempt.state.ManifestHash != committed.manifestHash {
+		t.Fatalf("committed state was lost on persistence failure: %+v", attempt.state)
+	}
+	if !strings.Contains(err.Error(), "carrier accepted rekey") {
+		t.Fatalf("error does not disclose carrier acceptance: %v", err)
+	}
+}
 
 func TestEnginePushFetchRoundTrip(t *testing.T) {
 	g := gitx.New(discard())
@@ -304,7 +387,7 @@ func TestRejectedBackendPushLeavesPinUnadvanced(t *testing.T) {
 
 	// A pushes its own child of oid1 against its stale view: planning accepts it
 	// (fast-forward from A's seen head) so the attempt reaches the backend, but
-	// the branch has moved to B's commit, so the plain FF push loses the CAS and,
+	// the branch has moved to B's commit, so the exact-lease push loses the CAS and,
 	// with retries disabled, the push terminates as CASExhausted.
 	a.commit(t, "f3.txt", "from a")
 	_, _, perr := a.e.Push(rsA, []RefUpdate{{Src: mainRef, Dst: mainRef}}, false)

@@ -1,4 +1,4 @@
-// Partial-mirror fallback: cloak fetches with blob:limit so the manifest
+// Partial-mirror fallback: cloak fetches with blob:none so the manifest
 // inlines while large packs stay lazy. If a host rejects filtering the
 // mirror must drop to full fetches and keep working. NOTE: local git
 // transport only *warns* on a rejected --filter (it does not error), so
@@ -60,7 +60,7 @@ func TestFetchWorksAgainstNonFilteringHost(t *testing.T) {
 
 	a := openMirror(t, g, host)
 	commit, _ := seedCommit(t, a, "manifest-ct", "pack-ct", 1)
-	if res, err := a.PushFF(commit); err != nil || res != PushOK {
+	if res, err := a.PushFF(commit, ""); err != nil || res != PushOK {
 		t.Fatalf("seed push = (%v, %v)", res, err)
 	}
 

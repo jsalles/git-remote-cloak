@@ -1,6 +1,6 @@
-// Pins the never-plain-force invariant at the source: the only two backend
-// push command lines that can be constructed are plain fast-forward and
-// force-with-lease with an explicit expected value.
+// Pins the exact-CAS invariant at the source: every backend push carries a
+// force-with-lease expected value, including an empty value that asserts the
+// branch does not yet exist.
 package backend
 
 import (
@@ -17,14 +17,8 @@ func TestPushArgsNeverPlainForce(t *testing.T) {
 			}
 		}
 		joined := strings.Join(args, " ")
-		if lease == "" {
-			if strings.Contains(joined, "force") {
-				t.Fatalf("fast-forward push contains force flag: %v", args)
-			}
-		} else {
-			if !strings.Contains(joined, "--force-with-lease=refs/heads/cloak:"+lease) {
-				t.Fatalf("lease push missing explicit expected value: %v", args)
-			}
+		if !strings.Contains(joined, "--force-with-lease=refs/heads/cloak:"+lease) {
+			t.Fatalf("push missing exact expected value: %v", args)
 		}
 	}
 }

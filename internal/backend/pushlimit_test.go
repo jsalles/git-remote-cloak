@@ -35,9 +35,10 @@ func TestClassifyPushFailureFallsThrough(t *testing.T) {
 
 func TestBackendRefRejectedPorcelainFlag(t *testing.T) {
 	// git --porcelain renders a refused ref update with a leading "!" flag and a
-	// "<from>:<to>" spec on stdout -- a genuine LOCAL compare-and-swap signal,
-	// whatever reason the host relays. Both a server-side mid-connection
-	// rejection and git's own stale-advertisement check produce it.
+	// "<from>:<to>" spec on stdout -- a genuine LOCAL ref-rejection signal,
+	// whatever reason the host relays. Both a policy rejection and a real
+	// stale-advertisement rejection produce it; the follow-up head probe is what
+	// distinguishes those outcomes.
 	for name, stdout := range map[string]string{
 		"server-side": "To origin\n" +
 			"!\t9e90bca:refs/heads/cloak\t[remote rejected] (failed to update ref)\nDone",
@@ -58,9 +59,8 @@ func TestBackendRefRejectedPorcelainFlag(t *testing.T) {
 func TestBackendRefRejectedIgnoresSideband(t *testing.T) {
 	// A hostile host cannot forge a rejection: CAS phrases in its "remote:"
 	// sideband never begin with "!\t", and stderr is not scanned at all. With no
-	// genuine porcelain "!" line for our branch this is not a CAS loss, so the
-	// push surfaces the real (transport) failure instead of retrying to
-	// exhaustion. Stdout here is deliberately adversarial (host text never
+	// genuine porcelain "!" line for our branch there is no reason to probe for
+	// a CAS loss. Stdout here is deliberately adversarial (host text never
 	// reaches stdout in practice) to show the flag itself cannot be spoofed.
 	stdout := "remote: !\t<oid>:refs/heads/cloak\t[rejected] (non-fast-forward)\n" +
 		"remote: cannot lock ref, stale info, fetch first - just kidding\n" +
@@ -76,5 +76,36 @@ func TestBackendRefRejectedOtherBranch(t *testing.T) {
 		"!\t<oid>:refs/heads/not-cloak\t[rejected] (non-fast-forward)\nDone"
 	if backendRefRejected(stdout, "cloak") {
 		t.Fatal("unrelated ref rejection misattributed to our branch")
+	}
+}
+
+func TestParseRemoteHead(t *testing.T) {
+	const (
+		ref = "refs/heads/cloak"
+		oid = "0123456789012345678901234567890123456789"
+	)
+	for _, tc := range []struct {
+		name   string
+		stdout string
+		head   string
+		exists bool
+		bad    bool
+	}{
+		{name: "absent", stdout: "\n"},
+		{name: "present", stdout: oid + "\t" + ref + "\n", head: oid, exists: true},
+		{name: "malformed", stdout: oid, bad: true},
+		{name: "wrong ref", stdout: oid + "\trefs/heads/other\n", bad: true},
+		{name: "multiple", stdout: oid + "\t" + ref + "\n" + oid + "\t" + ref, bad: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			head, exists, err := parseRemoteHead(tc.stdout, ref)
+			if (err != nil) != tc.bad {
+				t.Fatalf("parseRemoteHead error = %v, bad=%v", err, tc.bad)
+			}
+			if err == nil && (head != tc.head || exists != tc.exists) {
+				t.Fatalf("parseRemoteHead = (%q, %v), want (%q, %v)",
+					head, exists, tc.head, tc.exists)
+			}
+		})
 	}
 }

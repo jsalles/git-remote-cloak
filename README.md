@@ -182,9 +182,17 @@ revision or verified binary with your recovery material.
 
 Every fetch and push URL configured on the source repository must invoke the
 `cloak::` transport. A plain SSH/HTTPS URL bypasses this helper and sends the
-ordinary Git repository. Until an external pre-push policy enforces this
-automatically, inspect all URLs with `git remote -v` after setup or
-configuration changes.
+ordinary Git repository. cloak refuses to fetch, push, or report `status` for a
+remote whose effective `url`/`pushurl` list (after `insteadOf` rewriting)
+contains any non-`cloak::` entry, so a pull-then-push sync stops before the
+plain push. `git config remote.origin.vcs cloak` routes every URL of that remote
+through cloak and is accepted. cloak cannot see pushes that never invoke it
+(another remote, an explicit plain URL, or a plain URL listed first), so still
+inspect `git remote -v` after setup or configuration changes.
+
+Use a new, empty host repository. The first push refuses a host repository that
+already has branches or tags cloak did not write, because their history stays
+unencrypted on the host; `git cloak status` lists any such refs.
 
 ### Everyday use
 
@@ -318,6 +326,8 @@ git config (`cloak.*`):
 - `geometricFactor`, pack-consolidation aggressiveness (default 2; `0` disables).
 - `pushRetries`, compare-and-swap retry budget under concurrent pushes (default 5).
 - `branch`, the backend branch name on the host (default `cloak`).
+- `allowHostRefs`, create the carrier on a host repository that already holds
+  other refs (default `false`). Those refs keep their plaintext history.
 - `maxPackBytes`, the largest encrypted pack (one host file) cloak will publish.
   Pushes, repacks, and rekeys that exceed it in aggregate are split into several
   self-contained packs. A single object that still exceeds it is refused

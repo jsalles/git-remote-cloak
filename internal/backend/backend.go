@@ -696,6 +696,42 @@ func classifyStableRefRejection(err error) error {
 		"the carrier ref did not change; check branch protection, pre-receive hooks, repository permissions, and host policy")
 }
 
+// ForeignHostRefs lists every ref the host advertises other than the carrier
+// branch. cloak only ever writes refs/heads/<branch>, so anything else on the
+// carrier repository was pushed by something else and is not encrypted by
+// cloak (typically plaintext history left from before the repository was
+// switched to cloak, or a machine still pushing to the plain URL).
+func (b *Backend) ForeignHostRefs() ([]string, error) {
+	stdout, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Interactive: stdinIsTTY(),
+		MaxCapture: maxCapturedTransportBytes, SensitiveURLs: []string{b.url}},
+		"ls-remote", "--refs", "origin")
+	if err != nil {
+		return nil, gitx.ClassifyTransport("list host refs", err)
+	}
+	return foreignRefs(stdout, b.branch), nil
+}
+
+// foreignRefs extracts the non-carrier ref names from `git ls-remote --refs`
+// output. A line without the expected "<oid>\t<ref>" shape is reported whole
+// rather than skipped, so malformed host output cannot hide a ref.
+func foreignRefs(lsRemote, branch string) []string {
+	carrier := "refs/heads/" + branch
+	var refs []string
+	for _, line := range strings.Split(strings.TrimSpace(lsRemote), "\n") {
+		if line == "" {
+			continue
+		}
+		ref := line
+		if _, name, ok := strings.Cut(line, "\t"); ok {
+			ref = name
+		}
+		if ref != carrier {
+			refs = append(refs, ref)
+		}
+	}
+	return refs
+}
+
 // parseRemoteHead parses the exact-ref output of `git ls-remote --refs`.
 // Honest output is either empty (the branch is absent) or one `<oid> <ref>`
 // line. Anything else is ambiguous remote data and fails closed rather than

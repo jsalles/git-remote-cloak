@@ -32,11 +32,38 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "URL:        %s\n", urlredact.URL(*url))
 	}
 	fmt.Fprintf(stdout, "Key:        %s (%s)\n", sess.Eng.Key.ID(), sess.Cfg.KeyRef)
+	printHostRefs(sess, stdout)
 	if sess.RS.Manifest == nil {
 		fmt.Fprintln(stdout, "State:      empty (no backend branch yet; first push creates it)")
 		return 0
 	}
 	return printManifestStatus(sess, stdout, stderr)
+}
+
+// maxListedHostRefs bounds how many foreign host refs status prints by name.
+const maxListedHostRefs = 10
+
+// printHostRefs reports refs on the host that cloak did not write: their
+// history is not encrypted. A listing failure is shown but does not fail
+// status, which has already verified the carrier itself. Ref names come from
+// the host, so they are printed quoted.
+func printHostRefs(sess *setup.Session, stdout io.Writer) {
+	refs, err := sess.Eng.Be.ForeignHostRefs()
+	switch {
+	case err != nil:
+		fmt.Fprintf(stdout, "Host refs:  could not list (%v)\n", err)
+	case len(refs) == 0:
+		fmt.Fprintln(stdout, "Host refs:  carrier branch only")
+	default:
+		fmt.Fprintf(stdout, "Host refs:  WARNING: %d ref(s) not written by cloak; their history is NOT encrypted:\n", len(refs))
+		for i, ref := range refs {
+			if i == maxListedHostRefs {
+				fmt.Fprintf(stdout, "            ... and %d more\n", len(refs)-i)
+				break
+			}
+			fmt.Fprintf(stdout, "            %q\n", ref)
+		}
+	}
 }
 
 // printManifestStatus renders the populated-remote status block: pack-size

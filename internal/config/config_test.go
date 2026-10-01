@@ -43,6 +43,7 @@ func TestLoadOverrides(t *testing.T) {
 		"cloak.branch":          "vault",
 		"cloak.logLevel":        "debug",
 		"cloak.maxPackBytes":    "2097152",
+		"cloak.allowHostRefs":   "yes",
 	} {
 		if out, err := exec.Command("git", "--git-dir", gitDir, "config", k, v).CombinedOutput(); err != nil {
 			t.Fatalf("config %s: %v\n%s", k, err, out)
@@ -54,7 +55,7 @@ func TestLoadOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.KeyRef != "file:/x/key" || c.GeometricFactor != 3 || c.PushRetries != 9 ||
-		c.Branch != "vault" || c.LogLevel != "debug" || c.MaxPackBytes != 2097152 {
+		c.Branch != "vault" || c.LogLevel != "debug" || c.MaxPackBytes != 2097152 || !c.AllowHostRefs {
 		t.Fatalf("overrides not applied: %+v", c)
 	}
 }
@@ -112,4 +113,17 @@ type testWriter struct{ t *testing.T }
 func (w testWriter) Write(p []byte) (int, error) {
 	w.t.Log(string(p))
 	return len(p), nil
+}
+
+func TestIsGitTrue(t *testing.T) {
+	for _, v := range []string{"true", "YES", "on", "1", " true "} {
+		if !isGitTrue(v) {
+			t.Errorf("isGitTrue(%q) = false, want true", v)
+		}
+	}
+	for _, v := range []string{"false", "no", "off", "0", "", "maybe", "2"} {
+		if isGitTrue(v) {
+			t.Errorf("isGitTrue(%q) = true, want false (unknown values keep the safe default)", v)
+		}
+	}
 }

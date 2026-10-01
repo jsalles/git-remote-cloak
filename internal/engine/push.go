@@ -66,6 +66,11 @@ type pushAttempt struct {
 // lost compare-and-swap, retries against the re-fetched state until PushRetries
 // is exhausted.
 func (e *Engine) Push(rs *RemoteState, updates []RefUpdate, dryRun bool) ([]RefResult, *RemoteState, error) {
+	if rs == nil || rs.Head == "" {
+		if err := e.refuseForeignHostRefs(); err != nil {
+			return nil, rs, err
+		}
+	}
 	updates = e.freezeUpdateSources(updates)
 	advertised := advertisedDestinations(rs, updates)
 	cur := rs
@@ -82,6 +87,27 @@ func (e *Engine) Push(rs *RemoteState, updates []RefUpdate, dryRun bool) ([]RefR
 	return nil, cur, cloakerr.Newfh(cloakerr.CASExhausted, "push",
 		"another client keeps winning the race; wait for the other machine's sync to finish and re-run `git push`, or raise `git config cloak.pushRetries`",
 		"lost the compare-and-swap race %d times in a row; remote is under heavy concurrent pushing", e.Cfg.PushRetries+1)
+}
+
+// refuseForeignHostRefs stops the first push onto a host repository that
+// already holds refs cloak did not write. Creating the carrier there would
+// report success while those refs keep their unencrypted history on the host
+// (the usual case: an existing plaintext notes repository switched to cloak::).
+func (e *Engine) refuseForeignHostRefs() error {
+	if e.Cfg.AllowHostRefs {
+		return nil
+	}
+	refs, err := e.Be.ForeignHostRefs()
+	if err != nil {
+		return err
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	return cloakerr.Newfh(cloakerr.LocalGit, "create cloak backend",
+		"push to a NEW, empty private repository instead: existing branches keep their plaintext history on the host, and deleting them does not purge the host's copies. To create the carrier here anyway, run `git config cloak.allowHostRefs true`",
+		"the host repository already has %d ref(s) not written by cloak (for example %q); their history is not encrypted",
+		len(refs), refs[0])
 }
 
 // freezeUpdateSources resolves every non-delete source once, before the first

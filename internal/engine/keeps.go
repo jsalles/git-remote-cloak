@@ -58,11 +58,11 @@ func (e *Engine) ReapOrphanKeeps() {
 }
 
 // cloakKeeps returns the paths of pack .keep files in the local object store
-// that carry cloak's keep marker. A glob/read error or a non-cloak marker
+// that carry cloak's keep marker. A listing/read error or a non-cloak marker
 // excludes the file (fail safe: never act on a keep we did not create or cannot
 // read).
 func (e *Engine) cloakKeeps() []string {
-	matches, err := filepath.Glob(filepath.Join(e.LocalGitDir, "objects", "pack", "pack-*.keep"))
+	matches, err := listPackFiles(filepath.Join(e.LocalGitDir, "objects", "pack"), ".keep")
 	if err != nil {
 		return nil
 	}

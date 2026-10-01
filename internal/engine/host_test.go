@@ -46,7 +46,13 @@ func newHostRepo(t *testing.T, g *gitx.G) string {
 
 func newMachine(t *testing.T, g *gitx.G, host string, key keystore.Key) *machine {
 	t.Helper()
-	dir := t.TempDir()
+	return newMachineIn(t, g, host, key, t.TempDir())
+}
+
+// newMachineIn is newMachine with the working tree at dir, so tests can place
+// the repository under an unusual path (e.g. one containing glob characters).
+func newMachineIn(t *testing.T, g *gitx.G, host string, key keystore.Key, dir string) *machine {
+	t.Helper()
 	if _, _, err := g.Run(gitx.Opts{Scrub: true}, "init", "--initial-branch", "main", dir); err != nil {
 		t.Fatal(err)
 	}

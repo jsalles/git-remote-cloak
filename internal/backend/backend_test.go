@@ -285,3 +285,23 @@ func TestBuildCommitTreeShape(t *testing.T) {
 		t.Fatalf("commit metadata = %q", meta)
 	}
 }
+
+func TestForeignRefs(t *testing.T) {
+	out := "1111111111111111111111111111111111111111\trefs/heads/cloak\n" +
+		"2222222222222222222222222222222222222222\trefs/heads/main\n" +
+		"3333333333333333333333333333333333333333\trefs/tags/v1\n" +
+		"garbage-without-tab\n"
+	got := foreignRefs(out, "cloak")
+	want := []string{"refs/heads/main", "refs/tags/v1", "garbage-without-tab"}
+	if len(got) != len(want) {
+		t.Fatalf("foreignRefs = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("foreignRefs = %q, want %q", got, want)
+		}
+	}
+	if refs := foreignRefs("1111111111111111111111111111111111111111\trefs/heads/cloak\n", "cloak"); len(refs) != 0 {
+		t.Fatalf("carrier-only host reported foreign refs %q", refs)
+	}
+}

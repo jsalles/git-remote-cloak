@@ -29,6 +29,10 @@ type Config struct {
 	// into the private backend mirror before this check. 0 disables the check.
 	// Defaults to GitHub's per-file hard cap (100 MiB).
 	MaxPackBytes int64
+	// AllowHostRefs permits the first push onto a host repository that already
+	// holds refs cloak did not write. Off by default: those refs keep their
+	// unencrypted history on the host.
+	AllowHostRefs bool
 }
 
 // Defaults returns the documented default configuration.
@@ -105,6 +109,19 @@ func applyConfigSetting(c *Config, key, val string) {
 		c.LogLevel = val
 	case "cloak.maxpackbytes":
 		setIfValidInt64(&c.MaxPackBytes, val, 0)
+	case "cloak.allowhostrefs":
+		c.AllowHostRefs = isGitTrue(val)
+	}
+}
+
+// isGitTrue reports whether val is one of Git's true boolean spellings.
+// Anything else, including an unrecognized value, leaves the safe default off.
+func isGitTrue(val string) bool {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "true", "yes", "on", "1":
+		return true
+	default:
+		return false
 	}
 }
 

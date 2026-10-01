@@ -67,7 +67,11 @@ remain visible, so choose a non-sensitive carrier name.
 
 Every fetch or push URL configured on the source repository must invoke
 `cloak::`; a plain SSH/HTTPS URL bypasses the helper and sends the ordinary Git
-repository. Check `git remote -v` after setup or configuration changes. The
+repository. cloak refuses sessions on a remote with any non-`cloak::` url or
+pushurl (set `remote.origin.vcs=cloak` to route them all through cloak), but it
+cannot see other remotes, so check `git remote -v` after setup or configuration
+changes. Use a new, empty host repository: the first push refuses one that
+already holds refs cloak did not write. The
 carrier branch (default `cloak`) must permit force updates: repack, rekey, and
 automatic consolidation use an exact `--force-with-lease`, so a GitHub ruleset
 that forbids force pushes will block them.

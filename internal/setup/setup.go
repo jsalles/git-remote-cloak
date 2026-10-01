@@ -106,6 +106,9 @@ func OpenLocal(remoteName, url string, stderr io.Writer, role string) (*Session,
 	if err != nil {
 		return nil, err
 	}
+	if err := checkPlaintextRoutes(g, localGitDir, remoteName); err != nil {
+		return nil, err
+	}
 	stateName, selector := stateIdentity(g, localGitDir, remoteName, url, explicitURL)
 
 	return wireSession(g, cfg, sessionPaths{
@@ -301,28 +304,33 @@ func lfsTrackedPath(g *gitx.G, gitDir string) (string, error) {
 }
 
 // resolveBackendURL resolves and validates the backend transport URL. When url
-// is empty it is read from remote.<remoteName>.url (which must be a cloak::
-// remote); the cloak:: prefix is then stripped and the result is rejected if
-// empty or any external remote-helper transport (explicit ext::/fd::/nested
-// syntax or an unknown scheme:// URL).
+// is empty it is the remote's first effective URL (the one Git fetches from),
+// which must go through cloak (cloak:: prefix, or remote.<name>.vcs=cloak);
+// the cloak:: prefix is then stripped and the result is rejected if empty or
+// any external remote-helper transport (explicit ext::/fd::/nested syntax or
+// an unknown scheme:// URL).
 func resolveBackendURL(g *gitx.G, localGitDir, remoteName, url string) (string, error) {
 	if url == "" {
-		raw, err := g.Out(gitx.Opts{GitDir: localGitDir, SensitiveArgs: true, SensitiveURLs: []string{remoteName}},
-			"config", "--get", "remote."+remoteName+".url")
-		if err != nil {
+		if _, err := g.Out(gitx.Opts{GitDir: localGitDir, SensitiveArgs: true, SensitiveURLs: []string{remoteName}},
+			"config", "--get-all", "remote."+remoteName+".url"); err != nil {
 			return "", cloakerr.Newf(cloakerr.LocalGit, "resolve remote",
 				"remote %q has no configured URL", urlredact.URL(remoteName))
 		}
-		if !strings.HasPrefix(raw, "cloak::") {
-			return "", cloakerr.Newf(cloakerr.LocalGit, "resolve remote",
-				"remote %q is not a cloak:: remote (url %q)", urlredact.URL(remoteName), urlredact.URL(raw))
-		}
-		// Resolve url.*.insteadOf exactly as Git does before invoking a helper.
+		// Resolve url.*.insteadOf exactly as Git does before invoking a helper,
+		// and validate that same first URL: it is the one Git fetches from.
 		// --get-url performs no network access.
-		resolved, err := g.Out(gitx.Opts{GitDir: localGitDir, SensitiveArgs: true, SensitiveURLs: []string{raw}},
+		resolved, err := g.Out(gitx.Opts{GitDir: localGitDir, SensitiveArgs: true, SensitiveURLs: []string{remoteName}},
 			"ls-remote", "--get-url", "--", remoteName)
 		if err != nil {
 			return "", cloakerr.New(cloakerr.LocalGit, "resolve rewritten remote URL", err)
+		}
+		vcs, err := remoteUsesCloakVCS(g, localGitDir, remoteName)
+		if err != nil {
+			return "", err
+		}
+		if !routesThroughCloak(resolved, vcs) {
+			return "", cloakerr.Newf(cloakerr.LocalGit, "resolve remote",
+				"remote %q is not a cloak:: remote (url %q)", urlredact.URL(remoteName), urlredact.URL(resolved))
 		}
 		url = resolved
 	}

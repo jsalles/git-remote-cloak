@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/b4ryon/git-remote-cloak/internal/gitx"
+	"github.com/b4ryon/git-remote-cloak/internal/keystore"
 )
 
 func gitInDir(t *testing.T, dir string, args ...string) string {
@@ -114,5 +115,25 @@ func copyLooseObject(t *testing.T, srcGit, dstGit, oid string) {
 	}
 	if err := os.WriteFile(filepath.Join(dir, oid[2:]), data, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// ObjectClosure must report an absent tip as an incomplete closure (which the
+// fetch path repairs), not as a local failure, even though rev-list may
+// refuse a missing starting point.
+func TestObjectClosureMissingTipIsIncompleteNotError(t *testing.T) {
+	g := gitx.New(discard())
+	key, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newMachine(t, g, newHostRepo(t, g), key)
+	head := m.commit(t, "a.md", "a")
+	if ok, err := m.e.ObjectClosure([]string{head}); err != nil || !ok {
+		t.Fatalf("complete closure: ok=%v err=%v", ok, err)
+	}
+	absent := strings.Repeat("ab", 20)
+	if ok, err := m.e.ObjectClosure([]string{head, absent}); err != nil || ok {
+		t.Fatalf("missing tip: ok=%v err=%v; want incomplete without error", ok, err)
 	}
 }

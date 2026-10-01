@@ -362,7 +362,10 @@ func fetchLockLines(locks []string) []string {
 
 // fetchBatch applies all missing manifest packs, verifies every object Git
 // requested, then verifies the complete closure of every advertised ref before
-// advancing trust anchors. Returns .keep lock lines for the protocol.
+// advancing trust anchors. If anything is missing it first re-applies every
+// live pack (the applied set may be stale after local gc) and raises a tamper
+// alarm only if the objects are still missing. Returns .keep lock lines for
+// the protocol.
 func (s *session) fetchBatch(reqs []string) ([]string, error) {
 	if err := s.ensure(); err != nil {
 		return nil, err
@@ -371,21 +374,24 @@ func (s *session) fetchBatch(reqs []string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, r := range reqs {
-		oid, _, _ := strings.Cut(r, " ")
-		if !s.eng.HaveObject(oid) {
-			return nil, cloakerr.Newf(cloakerr.Tamper, "fetch verification",
-				"object %s advertised by the manifest was not provided by any pack", oid)
-		}
+	missing, err := s.missingAfterFetch(reqs)
+	if err != nil {
+		return nil, err
 	}
-	if s.rs.Manifest != nil {
-		tips := make([]string, 0, len(s.rs.Manifest.Refs))
-		for _, oid := range s.rs.Manifest.Refs {
-			tips = append(tips, oid)
+	if missing != "" {
+		// The applied set is only a cache: local gc may have pruned objects of
+		// packs it records (refs this clone does not track). Rebuild from every
+		// authenticated live pack before blaming the host.
+		s.log.Warn("objects missing locally after applying new packs; re-applying every live pack before verifying again", "missing", missing)
+		if err := s.eng.RepairAdvertisedClosure(s.rs); err != nil {
+			return nil, err
 		}
-		if !s.eng.HasObjectClosure(tips) {
+		if missing, err = s.missingAfterFetch(reqs); err != nil {
+			return nil, err
+		}
+		if missing != "" {
 			return nil, cloakerr.Newf(cloakerr.Tamper, "fetch verification",
-				"downloaded packs do not provide the complete object closure of every advertised ref")
+				"%s even after re-applying every live pack", missing)
 		}
 	}
 	// Only now that packs are applied and the full advertised closure is present
@@ -396,6 +402,34 @@ func (s *session) fetchBatch(reqs []string) ([]string, error) {
 	s.log.Info("fetch batch complete", "objects", len(reqs), "locks", len(locks))
 	s.spin.Stop() // clear the spinner line before the protocol response
 	return locks, nil
+}
+
+// missingAfterFetch describes what the local repository still lacks after a
+// fetch: an object git requested, or part of the closure of any advertised ref
+// (pins advance only over the complete closure). It returns "" when nothing is
+// missing, and an error only when the check itself failed locally.
+func (s *session) missingAfterFetch(reqs []string) (string, error) {
+	for _, r := range reqs {
+		oid, _, _ := strings.Cut(r, " ")
+		if !s.eng.HaveObject(oid) {
+			return fmt.Sprintf("object %s advertised by the manifest was not provided by any pack", oid), nil
+		}
+	}
+	if s.rs.Manifest == nil {
+		return "", nil
+	}
+	tips := make([]string, 0, len(s.rs.Manifest.Refs))
+	for _, oid := range s.rs.Manifest.Refs {
+		tips = append(tips, oid)
+	}
+	complete, err := s.eng.ObjectClosure(tips)
+	if err != nil {
+		return "", err
+	}
+	if !complete {
+		return "downloaded packs do not provide the complete object closure of every advertised ref", nil
+	}
+	return "", nil
 }
 
 // handlePush answers a "push " batch: it collects the refspec lines, runs the

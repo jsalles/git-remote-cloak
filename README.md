@@ -285,6 +285,9 @@ build with a stable self-signed code-signing certificate
   encrypted packs.
 - `accept-rollback` / `accept-repo-change`, one-shot overrides for a detected
   generation regression or repository-identity change (user-presence gated).
+  Accepting an empty remote with `accept-rollback` keeps the last seen
+  generation as a high-water mark, so a later restore of an older state of the
+  same repository still raises a rollback alarm.
 - `key export [--force-insecure]` / `key import` / `key delete`, key transfer,
   backup, and removal (delete requires a typed YES confirmation).
 

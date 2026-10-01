@@ -316,6 +316,14 @@ func (e *Engine) repackOnce(cur *RemoteState, key keystore.Key, rekeyed bool, at
 	if err != nil {
 		return repackAttempt{}, err
 	}
+	// A repack replaces the whole carrier under a lease. Publishing an empty
+	// pack set for a manifest that still advertises refs would delete every
+	// object from the host, so refuse before building or pushing anything (and
+	// therefore before rekey switches cloak.keyRef).
+	if len(packs) == 0 && len(cur.Manifest.Refs) > 0 {
+		return repackAttempt{}, cloakerr.Newf(cloakerr.LocalGit, operation,
+			"produced no packs for a manifest with %d refs; refusing to replace the carrier", len(cur.Manifest.Refs))
+	}
 	man, err := repackManifest(cur, packs)
 	if err != nil {
 		(&pushPlan{packs: packs}).abort()

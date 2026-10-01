@@ -730,11 +730,10 @@ func (e *Engine) splitEncryptPacks(stdin string, wants []string, budget int64, k
 		"--max-pack-size", strconv.FormatInt(budget, 10), base); err != nil {
 		return nil, cloakerr.New(cloakerr.LocalGit, "split pack objects", err)
 	}
-	plainPacks, err := filepath.Glob(base + "-*.pack")
+	plainPacks, err := listPackFiles(scratch, ".pack")
 	if err != nil {
 		return nil, fmt.Errorf("list split packs: %w", err)
 	}
-	sort.Strings(plainPacks)
 
 	var packs []plannedPack
 	cleanup := func() error {
@@ -763,10 +762,34 @@ func (e *Engine) splitEncryptPacks(stdin string, wants []string, budget int64, k
 		packs = append(packs, pp)
 	}
 	if len(packs) == 0 {
-		return nil, nil
+		// Callers split only after the single-pack attempt proved there are
+		// objects to send, so an empty result means the split output was lost.
+		// Returning "no packs" here would publish refs without their objects.
+		return nil, cloakerr.Newf(cloakerr.LocalGit, "split pack objects",
+			"%s split produced no packs in %q although objects were selected", operation, scratch)
 	}
 	e.Log.Info("split oversized operation into packs", "operation", operation, "packs", len(packs))
 	return packs, nil
+}
+
+// listPackFiles returns the sorted paths of the regular files in dir named
+// "pack-*<suffix>". It lists the directory literally instead of globbing, so
+// glob metacharacters ('[', '\\', '*', '?') in the repository's own path can
+// neither hide git's output nor match files in other directories.
+func listPackFiles(dir, suffix string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, ent := range entries {
+		name := ent.Name()
+		if ent.Type().IsRegular() && strings.HasPrefix(name, "pack-") && strings.HasSuffix(name, suffix) {
+			paths = append(paths, filepath.Join(dir, name))
+		}
+	}
+	sort.Strings(paths)
+	return paths, nil
 }
 
 // encryptPackFile encrypts the plaintext pack at plainPath (one of the split

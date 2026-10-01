@@ -377,3 +377,63 @@ func TestUrlHashDirAdoptedByNamedRemote(t *testing.T) {
 		t.Fatal("named remote did not adopt the url-hash state dir (TOFU pin lost)")
 	}
 }
+
+// Accepting an empty remote used to delete the generation pin outright, so a
+// later replay of ANY older state of the same repository was trusted on first
+// use. The pin now survives as an accepted-empty mark.
+func TestAcceptEmptyKeepsRollbackMark(t *testing.T) {
+	d := openDir(t)
+	hashA, hashB := strings.Repeat("aa", 32), strings.Repeat("bb", 32)
+	m := func(gen uint64) *manifest.Manifest {
+		mm := manifest.New()
+		mm.Generation = gen
+		return mm
+	}
+	if err := d.SavePins(Pin{Generation: 4, ManifestHash: hashA}, strings.Repeat("ab", 16)); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.AcceptEmpty(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := d.LoadPin(); err != nil || ok {
+		t.Fatalf("pin still present after accepting an empty remote: ok=%v err=%v", ok, err)
+	}
+	if err := d.CheckPin(nil, ""); err != nil {
+		t.Fatalf("accepted empty remote refused: %v", err)
+	}
+	for _, gen := range []uint64{1, 3} {
+		if err := d.CheckPin(m(gen), hashB); err == nil {
+			t.Fatalf("replayed generation %d accepted after accepting an empty remote", gen)
+		} else if k, _ := cloakerr.KindOf(err); k != cloakerr.Rollback {
+			t.Fatalf("replay not classified Rollback: %v", err)
+		}
+	}
+	if err := d.CheckPin(m(4), hashB); err == nil {
+		t.Fatal("different state at the marked generation accepted")
+	}
+	if err := d.CheckPin(m(4), hashA); err != nil {
+		t.Fatalf("the marked state itself refused: %v", err)
+	}
+	if err := d.CheckPin(m(5), hashB); err != nil {
+		t.Fatalf("newer state refused: %v", err)
+	}
+
+	// A durable pin pair supersedes the mark.
+	if err := d.SavePins(Pin{Generation: 1, ManifestHash: hashB}, strings.Repeat("cd", 16)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := d.LoadAcceptedEmpty(); err != nil || ok {
+		t.Fatalf("mark survived a new pin pair: ok=%v err=%v", ok, err)
+	}
+
+	// accept-repo-change (ClearPin) resets everything, the mark included.
+	if err := d.AcceptEmpty(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ClearPin(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := d.LoadAcceptedEmpty(); err != nil || ok {
+		t.Fatalf("ClearPin left the accepted-empty mark: ok=%v err=%v", ok, err)
+	}
+}

@@ -84,6 +84,15 @@ func printManifestStatus(sess *setup.Session, stdout, stderr io.Writer) int {
 		return cliFailLogged(stderr, sess, err)
 	}
 	printGenerationLine(stdout, m, pin, pinned)
+	if !pinned {
+		mark, marked, err := sess.St.LoadAcceptedEmpty()
+		if err != nil {
+			return cliFailLogged(stderr, sess, err)
+		}
+		if marked {
+			fmt.Fprintf(stdout, "Rollback:   an empty remote was accepted after generation %d; only newer states are trusted\n", mark.Generation)
+		}
+	}
 	fmt.Fprintf(stdout, "Manifest:   %s (current remote)\n", sess.RS.ManifestHash)
 	rid, ridOK, err := sess.St.LoadRepoID()
 	if err != nil {
@@ -178,7 +187,7 @@ type acceptSpec struct {
 	requireMatchingRepoID bool
 	// describe reports what is being discarded (or that nothing was set).
 	describe func(sess *setup.Session)
-	// clear removes obsolete anchors when an explicitly accepted remote is empty.
+	// clear retires obsolete anchors when an explicitly accepted remote is empty.
 	clear func(sess *setup.Session) error
 	// accepted reports the final pinned state.
 	accepted func(sess *setup.Session)
@@ -217,7 +226,7 @@ func runAcceptOnSession(spec acceptSpec, sess *setup.Session, stdout, stderr io.
 		if err := spec.clear(sess); err != nil {
 			return cliFailLogged(stderr, sess, err)
 		}
-		fmt.Fprintln(stdout, "Accepted: remote is currently empty; next push recreates it.")
+		fmt.Fprintln(stdout, "Accepted: remote is currently empty. The next push from this machine recreates it with a NEW repository identity; other machines will then need `git cloak accept-repo-change`.")
 		return 0
 	}
 	if err := sess.Eng.VerifyApplyAndCommitPin(sess.RS, spec.requireMatchingRepoID); err != nil {
@@ -249,7 +258,9 @@ func cmdAcceptRollback(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintln(stdout, "No rollback pin was set (nothing to accept).")
 			}
 		},
-		clear: func(sess *setup.Session) error { return sess.St.ClearPin() },
+		// An accepted empty remote keeps the old pin as a high-water mark so the
+		// host cannot later restore an older state of this repository silently.
+		clear: func(sess *setup.Session) error { return sess.St.AcceptEmpty() },
 		accepted: func(sess *setup.Session) {
 			fmt.Fprintf(stdout, "Accepted: now pinned at generation %d.\n", sess.RS.Manifest.Generation)
 		},

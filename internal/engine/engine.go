@@ -345,12 +345,27 @@ func (e *Engine) HaveObject(oid string) bool {
 // any reported-missing object) returns false, so a caller that uses this to
 // skip a download fails safe by downloading instead.
 func (e *Engine) HasObjectClosure(oids []string) bool {
+	complete, err := e.ObjectClosure(oids)
+	return err == nil && complete
+}
+
+// ObjectClosure is HasObjectClosure for callers that must tell a genuinely
+// incomplete closure (false, nil) from a local failure to check it (an error
+// classified as LocalGit). A walk that fails while some tip object is absent
+// is reported as incomplete: rev-list may refuse a missing starting point
+// rather than print it. Only when every tip exists is the failure a local
+// problem (a timeout, a corrupt store), which must not be reported as host
+// tampering.
+func (e *Engine) ObjectClosure(oids []string) (bool, error) {
 	if len(oids) == 0 {
-		return true
+		return true, nil
 	}
 	shallow, err := e.G.Out(gitx.Opts{GitDir: e.LocalGitDir}, "rev-parse", "--is-shallow-repository")
-	if err != nil || shallow == "true" {
-		return false
+	if err != nil {
+		return false, cloakerr.New(cloakerr.LocalGit, "inspect shallow repository state", err)
+	}
+	if shallow == "true" {
+		return false, cloakerr.Newf(cloakerr.LocalGit, "verify object closure", "repository is shallow")
 	}
 	// Stream revisions on stdin instead of expanding one argv entry per ref.
 	// A manifest may legitimately advertise enough refs to exceed the OS command
@@ -362,15 +377,53 @@ func (e *Engine) HasObjectClosure(oids []string) bool {
 		revs.WriteString(oid)
 		revs.WriteByte('\n')
 	}
+	// GIT_COMMIT_GRAPH_PARANOIA makes rev-list confirm that commits listed in a
+	// (possibly stale) commit-graph still exist in the object store; otherwise a
+	// lost commit would be walked through and not reported missing.
 	out, _, err := e.G.Run(gitx.Opts{
 		GitDir: e.LocalGitDir,
-		Env:    []string{"GIT_NO_REPLACE_OBJECTS=1"},
+		Env:    []string{"GIT_NO_REPLACE_OBJECTS=1", "GIT_COMMIT_GRAPH_PARANOIA=1"},
 		Stdin:  strings.NewReader(revs.String()),
 	}, "rev-list", "--objects", "--missing=print", "--stdin")
 	if err != nil {
-		return false
+		for _, oid := range oids {
+			if !e.HaveObject(oid) {
+				return false, nil
+			}
+		}
+		return false, cloakerr.New(cloakerr.LocalGit, "walk local object closure", err)
 	}
-	return !revListReportsMissing(out)
+	return !revListReportsMissing(out), nil
+}
+
+// RepairAdvertisedClosure re-applies every live pack of rs, ignoring the
+// applied set, Replaces lineage and the closure shortcut. The applied set is a
+// cache: objects it vouches for can legitimately disappear (git gc prunes
+// objects no local ref reaches, e.g. on a single-branch clone), so before a
+// fetch raises a tamper alarm it rebuilds from the authenticated packs. Each
+// pack still passes the size, hash and AEAD checks. The re-applied packs keep
+// their cloak .keep (they are not reported to git as fetch locks), so
+// ReapOrphanKeeps holds them while their objects stay unreachable and gc
+// cannot prune them again.
+func (e *Engine) RepairAdvertisedClosure(rs *RemoteState) error {
+	if rs == nil || rs.Manifest == nil {
+		return nil
+	}
+	applied, err := e.St.AppliedSet()
+	if err != nil {
+		return err
+	}
+	var newlyApplied []string
+	for i, p := range rs.Manifest.Packs {
+		e.phase("re-applying pack %d/%d", i+1, len(rs.Manifest.Packs))
+		if _, err := e.applyPack(rs.Head, p); err != nil {
+			return err
+		}
+		if !applied[p.ID] {
+			newlyApplied = append(newlyApplied, p.ID)
+		}
+	}
+	return e.St.MarkApplied(newlyApplied...)
 }
 
 // revListReportsMissing reports whether git rev-list --objects --missing=print

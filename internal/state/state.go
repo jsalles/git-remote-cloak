@@ -283,13 +283,19 @@ const pinFile = "generation"
 
 // LoadPin returns the stored pin; ok=false on first contact.
 func (d *Dir) LoadPin() (Pin, bool, error) {
-	b, ok, err := d.readStateFile(pinFile)
+	return d.loadPinFile(pinFile)
+}
+
+// loadPinFile reads a "<generation> <manifest-hash>" record (the rollback pin
+// or the accepted-empty mark); ok=false when the file does not exist.
+func (d *Dir) loadPinFile(name string) (Pin, bool, error) {
+	b, ok, err := d.readStateFile(name)
 	if err != nil || !ok {
 		return Pin{}, ok, err
 	}
 	var p Pin
 	if _, err := fmt.Sscanf(strings.TrimSpace(string(b)), "%d %s", &p.Generation, &p.ManifestHash); err != nil {
-		return Pin{}, false, fmt.Errorf("corrupt pin file %s: %w", filepath.Join(d.Root, pinFile), err)
+		return Pin{}, false, fmt.Errorf("corrupt pin file %s: %w", filepath.Join(d.Root, name), err)
 	}
 	// The pin's manifest hash is a SHA-256 ciphertext digest (ciphertextHash),
 	// always exactly 64 lowercase hex. Reject any other shape as corrupt rather
@@ -298,9 +304,34 @@ func (d *Dir) LoadPin() (Pin, bool, error) {
 	// rollback anchor and quietly overwritten by the next higher-generation state.
 	if !manifest.IsLowerHex(p.ManifestHash, 64) {
 		return Pin{}, false, fmt.Errorf("corrupt pin file %s: manifest hash is not 64 lowercase hex",
-			filepath.Join(d.Root, pinFile))
+			filepath.Join(d.Root, name))
 	}
 	return p, true, nil
+}
+
+const acceptedEmptyFile = "accepted-empty"
+
+// LoadAcceptedEmpty returns the rollback high-water mark recorded when an
+// empty remote was explicitly accepted; ok=false when there is none.
+func (d *Dir) LoadAcceptedEmpty() (Pin, bool, error) {
+	return d.loadPinFile(acceptedEmptyFile)
+}
+
+// AcceptEmpty records the operator's acceptance of an empty remote. The
+// rollback pin is retired (an empty remote has nothing to pin) but kept as the
+// accepted-empty mark, so CheckPin still refuses any later state at or below
+// it: accepting a wiped carrier must not let the host restore an older one
+// silently. A missing pin keeps any earlier mark; an unreadable pin carries no
+// usable mark and is only removed.
+func (d *Dir) AcceptEmpty() error {
+	pin, ok, err := d.LoadPin()
+	if err == nil && ok {
+		if err := d.writeStateFile("accepted-empty", acceptedEmptyFile,
+			[]byte(fmt.Sprintf("%d %s\n", pin.Generation, pin.ManifestHash))); err != nil {
+			return err
+		}
+	}
+	return d.removeStateFile(pinFile)
 }
 
 // SavePin atomically persists the pin.
@@ -339,7 +370,9 @@ func (d *Dir) SavePins(p Pin, repoID string) error {
 	if err := syncDir(d.Root); err != nil {
 		return fmt.Errorf("write state file %q: %w", pinFile, err)
 	}
-	return nil
+	// A durable pin pair supersedes the accepted-empty mark (CheckPin only
+	// consults the mark while no pin exists).
+	return d.removeStateFile(acceptedEmptyFile)
 }
 
 // CheckPin enforces rollback protection for a validated remote manifest:
@@ -353,7 +386,7 @@ func (d *Dir) CheckPin(m *manifest.Manifest, manifestHash string) error {
 		return err
 	}
 	if !ok {
-		return nil // trust-on-first-use
+		return d.checkAcceptedEmpty(m, manifestHash)
 	}
 	if m == nil {
 		return cloakerr.Newf(cloakerr.Rollback, "remote state",
@@ -376,10 +409,35 @@ func (d *Dir) CheckPin(m *manifest.Manifest, manifestHash string) error {
 	}
 }
 
-// ClearPin removes the rollback pin, returning protection to
-// trust-on-first-use for the next fetch. Only `git cloak accept-rollback`
-// calls this; it is deliberately not reachable via configuration.
-func (d *Dir) ClearPin() error { return d.removeStateFile(pinFile) }
+// checkAcceptedEmpty applies the accepted-empty mark when no rollback pin
+// exists: without a mark this is trust-on-first-use; with one, only a state
+// strictly newer than the mark (or the marked state itself) is accepted.
+func (d *Dir) checkAcceptedEmpty(m *manifest.Manifest, manifestHash string) error {
+	mark, ok, err := d.LoadAcceptedEmpty()
+	if err != nil {
+		return err
+	}
+	if !ok || m == nil {
+		return nil
+	}
+	if m.Generation > mark.Generation || (m.Generation == mark.Generation && manifestHash == mark.ManifestHash) {
+		return nil
+	}
+	return cloakerr.Newf(cloakerr.Rollback, "remote state",
+		"remote generation %d is not newer than generation %d, the last state seen before an empty remote was accepted (host restored old state?); run `%s` if this is expected",
+		m.Generation, mark.Generation, d.acceptCmd("accept-rollback"))
+}
+
+// ClearPin removes the rollback pin and any accepted-empty mark, returning
+// protection to trust-on-first-use for the next fetch. Only `git cloak
+// accept-repo-change` calls this (a different repository has an unrelated
+// generation history); it is deliberately not reachable via configuration.
+func (d *Dir) ClearPin() error {
+	if err := d.removeStateFile(pinFile); err != nil {
+		return err
+	}
+	return d.removeStateFile(acceptedEmptyFile)
+}
 
 const repoIDFile = "repoid"
 

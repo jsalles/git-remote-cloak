@@ -75,6 +75,36 @@ func TestOpenPruneCannotFollowInheritedObjectDirectory(t *testing.T) {
 	}
 }
 
+// An inherited GIT_CONFIG used to become the target of every mirror `git
+// config` write, planting the carrier as a plain remote.origin in (for example)
+// the user's global config, from where ordinary pushes sent plaintext.
+func TestOpenIgnoresInheritedGitConfig(t *testing.T) {
+	redirected := filepath.Join(t.TempDir(), "gitconfig")
+	const original = "[user]\n\tname = someone\n"
+	if err := os.WriteFile(redirected, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG", redirected)
+	lg := slog.New(slog.DiscardHandler)
+	g := gitx.New(lg)
+	b, err := Open(g, filepath.Join(t.TempDir(), "backend.git"), "/nonexistent-host", "cloak", lg)
+	if err != nil {
+		t.Fatalf("Open with inherited GIT_CONFIG: %v", err)
+	}
+	b.disablePartial()
+	got, err := os.ReadFile(redirected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Fatalf("mirror configuration leaked into GIT_CONFIG target:\n%s", got)
+	}
+	url, err := g.Out(gitx.Opts{GitDir: b.gitDir}, "config", "--file", b.configPath(), "--get", "remote.origin.url")
+	if err != nil || url != "/nonexistent-host" {
+		t.Fatalf("mirror remote.origin.url = %q, %v; want /nonexistent-host", url, err)
+	}
+}
+
 func TestOpenPinsBackendObjectFormatToSHA1(t *testing.T) {
 	global := filepath.Join(t.TempDir(), "gitconfig")
 	if err := os.WriteFile(global, []byte("[init]\n\tdefaultObjectFormat = sha256\n"), 0o600); err != nil {

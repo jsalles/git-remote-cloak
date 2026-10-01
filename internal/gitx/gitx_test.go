@@ -77,9 +77,11 @@ func TestApplyGitEnvCannotReenableCommandTransports(t *testing.T) {
 		"GIT_ALLOW_PROTOCOL=ssh:ext:fd:https",
 		"GIT_OBJECT_DIRECTORY=/source/objects",
 		"GIT_WORK_TREE=/source",
+		"GIT_CONFIG=/home/user/.gitconfig",
 	}, Opts{Env: []string{
 		"GIT_ALLOW_PROTOCOL=file:ext",
 		"GIT_ALTERNATE_OBJECT_DIRECTORIES=/source/other",
+		"GIT_CONFIG=/elsewhere",
 	}})
 	want := []string{
 		"PATH=/bin",

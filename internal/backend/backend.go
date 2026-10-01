@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -94,7 +95,9 @@ func Open(g *gitx.G, gitDir, url, branch string, log *slog.Logger) (*Backend, er
 			opts.SensitiveArgs = true
 			opts.SensitiveURLs = []string{url}
 		}
-		if _, _, err := b.g.Run(opts, "config", kv[0], kv[1]); err != nil {
+		// An explicit --file pins every write to the mirror's own config even
+		// if a config-redirecting variable ever reaches the child (see gitx).
+		if _, _, err := b.g.Run(opts, "config", "--file", b.configPath(), kv[0], kv[1]); err != nil {
 			return nil, cloakerr.New(cloakerr.LocalGit, "configure backend mirror", err)
 		}
 	}
@@ -189,10 +192,22 @@ func (b *Backend) URL() string { return urlredact.URL(b.url) }
 func (b *Backend) disablePartial() {
 	b.partial = false
 	for _, key := range []string{"remote.origin.promisor", "remote.origin.partialclonefilter"} {
-		_, _, _ = b.g.Run(gitx.Opts{GitDir: b.gitDir}, "config", "--unset", key)
+		_, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir}, "config", "--file", b.configPath(), "--unset", key)
+		var gerr *gitx.GitError
+		if err != nil && !(errors.As(err, &gerr) && gerr.ExitCode == configKeyAbsent) {
+			// The fallback fetch reports its own failure if the filter stays
+			// configured; record why so that failure can be explained.
+			b.log.Warn("could not remove partial-clone setting from backend mirror", "key", key, "err", err)
+		}
 	}
 	b.log.Warn("host does not support partial fetch (blob:none); falling back to full fetches; consolidated packs will re-download")
 }
+
+// configKeyAbsent is `git config --unset`'s exit status when the key is not set.
+const configKeyAbsent = 5
+
+// configPath is the mirror's own config file, the only file cloak writes.
+func (b *Backend) configPath() string { return filepath.Join(b.gitDir, "config") }
 
 // Fetch updates the mirror from the host. It returns the backend branch tip
 // oid, or empty=true when the branch does not exist yet (fresh remote).

@@ -198,16 +198,21 @@ func applyGitEnv(parent []string, o Opts) []string {
 }
 
 // isRepositoryRedirectEnv identifies Git environment variables that can point
-// a command at object, ref, index, worktree, shallow, graft, or replacement
-// state outside the explicit Opts.GitDir. Inheriting any of them would let a
-// backend maintenance command (notably prune) mutate the source repository.
+// a command at object, ref, index, worktree, shallow, graft, replacement, or
+// config state outside the explicit Opts.GitDir. Inheriting any of them would
+// let a backend maintenance command (notably prune) mutate the source
+// repository. GIT_CONFIG is the legacy default target of `git config`: left in
+// place, cloak's mirror configuration (including the carrier URL as a plain
+// remote.origin.url) would be written into whatever file it names, such as the
+// user's global config, from where ordinary pushes would send plaintext.
 func isRepositoryRedirectEnv(kv string) bool {
 	key, _, _ := strings.Cut(kv, "=")
 	switch key {
 	case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
 		"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_INDEX_FILE", "GIT_INDEX_VERSION",
 		"GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE", "GIT_GRAFT_FILE", "GIT_NAMESPACE",
-		"GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_INTERNAL_SUPER_PREFIX", "GIT_QUARANTINE_PATH":
+		"GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_INTERNAL_SUPER_PREFIX", "GIT_QUARANTINE_PATH",
+		"GIT_CONFIG":
 		return true
 	default:
 		return false
